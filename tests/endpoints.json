@@ -2636,9 +2636,10 @@
         "map",
         "address",
         "value",
+        "entries",
         "program"
       ],
-      "description": "Set a value at an address in a property map. The value is coerced to the map's type (int/long/string); 'void' maps ignore the value and just tag the address. Create the map first with create_property_map. Call save_program to persist."
+      "description": "Set ONE property at an address in a property map OR MANY in one transaction (entries=[{address,value}, ...]). The value is coerced to the map's type (int/long/string); 'void' maps ignore the value and just tag the address. Create the map first with create_property_map. Call save_program to persist."
     },
     {
       "path": "/set_variable_storage",

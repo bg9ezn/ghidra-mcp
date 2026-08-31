@@ -44,6 +44,12 @@ with a comma-separated `addresses` query parameter (it was a POST with a JSON
 array), which also puts it on the concurrent read path instead of the
 serialized write path.
 
+**Single/batch (new capability on a survivor).** `set_property` now accepts a
+bulk `entries=[{address,value}]` array in addition to the single
+`address`+`value` form, writing all entries in one transaction. It never had a
+separate `batch_` predecessor; this simply brings the property-map writer onto
+the same one-or-many pattern as the rest of the survivors.
+
 **True duplicates (−4).** `get_data_type_size` → `get_type_size` (a strict
 superset: adds alignment + path); `validate_data_type_exists` →
 `validate_data_type` with `address` now optional;

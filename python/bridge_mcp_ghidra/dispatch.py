@@ -48,6 +48,11 @@ def get_timeout(endpoint: str, payload: dict | None = None) -> int:
         count += 1 if payload.get("plate_comment") else 0
         return min(base + count * 8, 600)
 
+    if name == "set_property":
+        count = len(payload.get("entries", [])) if payload else 0
+        if count > 1:
+            return min(base + count * 3, 600)
+
     return base
 
 

@@ -1328,6 +1328,22 @@ class TestGetTimeout(unittest.TestCase):
         timeout = get_timeout("/batch_set_comments", payload)
         self.assertGreater(timeout, 120)
 
+    def test_batch_set_property_scaling(self):
+        from bridge_mcp_ghidra import get_timeout
+
+        payload = {
+            "map": "flags",
+            "entries": [{"address": "0x1000", "value": "1"}] * 10,
+        }
+        timeout = get_timeout("/set_property", payload)
+        self.assertGreater(timeout, 30)
+
+    def test_set_property_single_no_scaling(self):
+        from bridge_mcp_ghidra import get_timeout
+
+        payload = {"map": "flags", "address": "0x1000", "value": "1"}
+        self.assertEqual(get_timeout("/set_property", payload), 30)
+
 
 class TestBuildToolFunction(unittest.TestCase):
     """Test dynamic tool function builder."""

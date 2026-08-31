@@ -657,7 +657,7 @@ python -m tools.setup install-ghidra-deps --ghidra-path "C:\ghidra_12.1.2_PUBLIC
 - `save_program` - Save current program
 - `set_image_base` - Set the base address of the program (rebases all addresses)
 - `set_program_option` - Set a typed program option
-- `set_property` - Set a value at an address in a property map
+- `set_property` - Set ONE property at an address in a property map OR MANY in one transaction (entries=[{address,value}, ...])
 - `switch_program` - Switch current program
 
 ### Project Organization

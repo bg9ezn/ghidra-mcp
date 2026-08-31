@@ -723,17 +723,24 @@ public class ProgramScriptService {
      * {@link ghidra.util.Saveable} type). The map must already exist.
      */
     @McpTool(path = "/set_property", method = "POST",
-             description = "Set a value at an address in a property map. The value is coerced to the map's type (int/long/string); 'void' maps ignore the value and just tag the address. Create the map first with create_property_map. Call save_program to persist.",
+             description = "Set ONE property at an address in a property map OR MANY in one transaction (entries=[{address,value}, ...]). The value is coerced to the map's type (int/long/string); 'void' maps ignore the value and just tag the address. Create the map first with create_property_map. Call save_program to persist.",
              category = "program")
     public Response setProperty(
             @Param(value = "map", source = ParamSource.BODY, description = "Property map name (from list_property_maps).") String mapName,
-            @Param(value = "address", paramType = "address", source = ParamSource.BODY, description = ADDRESS_PARAM_DESC) String addressStr,
+            @Param(value = "address", paramType = "address", source = ParamSource.BODY, defaultValue = "",
+                   description = "Address (single mode). Omit when using entries[].") String addressStr,
             @Param(value = "value", source = ParamSource.BODY, defaultValue = "",
-                   description = "Value to store, as a string; parsed per the map's type. Ignored for 'void' maps.") String value,
+                   description = "Value to store, as a string; parsed per the map's type. Ignored for 'void' maps. (single mode).") String value,
+            @Param(value = "entries", source = ParamSource.BODY, defaultValue = "[]",
+                   description = "Bulk mode: array of {address, value} objects. When non-empty, address/value params are ignored.") List<Map<String, String>> entries,
             @Param(value = "program", defaultValue = "") String programName) {
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
         Program program = pe.program();
+
+        if (entries != null && !entries.isEmpty()) {
+            return batchSetProperty(mapName, entries, programName);
+        }
 
         if (mapName == null || mapName.isEmpty()) return Response.err("map is required");
         if (addressStr == null || addressStr.isEmpty()) return Response.err("address is required");
@@ -795,6 +802,105 @@ public class ProgramScriptService {
             "value", parsed,
             "note", "Call save_program to persist this change to the database.",
             "program", program.getName()));
+    }
+
+    // Bulk helper for set_property(entries=[...]). Merged into set_property in 7.0.0;
+    // no longer a standalone @McpTool.
+    public Response batchSetProperty(
+            @Param(value = "map", source = ParamSource.BODY) String mapName,
+            @Param(value = "entries", source = ParamSource.BODY) List<Map<String, String>> entries,
+            @Param(value = "program", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        if (mapName == null || mapName.isEmpty()) return Response.err("map is required");
+        if (entries == null || entries.isEmpty()) return Response.err("No entries provided");
+
+        PropertyMap<?> map = program.getUsrPropertyManager().getPropertyMap(mapName);
+        if (map == null) {
+            return Response.err("No property map named '" + mapName + "'. Create it with create_property_map.");
+        }
+
+        if (map instanceof ObjectPropertyMap) {
+            return Response.err("Object property maps cannot be written via MCP (they require a registered Saveable type).");
+        }
+
+        final AtomicInteger successCount = new AtomicInteger(0);
+        final AtomicInteger errorCount = new AtomicInteger(0);
+        final List<String> errors = new ArrayList<>();
+
+        try {
+            threadingStrategy.executeWrite(program, "Batch Set Property", () -> {
+                for (Map<String, String> entry : entries) {
+                    String addressStr = entry.get("address");
+                    String value = entry.get("value");
+
+                    if (addressStr == null || addressStr.isEmpty()) {
+                        errors.add("Missing 'address' in entry");
+                        errorCount.incrementAndGet();
+                        continue;
+                    }
+
+                    Address address = ServiceUtils.parseAddress(program, addressStr);
+                    if (address == null) {
+                        errors.add(ServiceUtils.getLastParseError());
+                        errorCount.incrementAndGet();
+                        continue;
+                    }
+
+                    try {
+                        if (map instanceof IntPropertyMap ip) {
+                            if (value == null || value.isEmpty()) {
+                                errors.add("Value required for int map at " + addressStr);
+                                errorCount.incrementAndGet();
+                                continue;
+                            }
+                            ip.add(address, Integer.parseInt(value.trim()));
+                        } else if (map instanceof LongPropertyMap lp) {
+                            if (value == null || value.isEmpty()) {
+                                errors.add("Value required for long map at " + addressStr);
+                                errorCount.incrementAndGet();
+                                continue;
+                            }
+                            lp.add(address, Long.parseLong(value.trim()));
+                        } else if (map instanceof StringPropertyMap sp) {
+                            if (value == null) {
+                                errors.add("Value required for string map at " + addressStr);
+                                errorCount.incrementAndGet();
+                                continue;
+                            }
+                            sp.add(address, value);
+                        } else if (map instanceof VoidPropertyMap vp) {
+                            vp.add(address);
+                        }
+                        successCount.incrementAndGet();
+                    } catch (NumberFormatException nfe) {
+                        errors.add("Invalid value '" + value + "' at " + addressStr + ": " + nfe.getMessage());
+                        errorCount.incrementAndGet();
+                    } catch (Exception e) {
+                        errors.add("Error at " + addressStr + ": " + e.getMessage());
+                        errorCount.incrementAndGet();
+                    }
+                }
+                return null;
+            });
+        } catch (Exception e) {
+            return Response.err("Batch transaction failed: " + e.getMessage());
+        }
+
+        Map<String, Object> result = JsonHelper.mapOf(
+                "success", true,
+                "map", mapName,
+                "entries_set", successCount.get(),
+                "entries_failed", errorCount.get(),
+                "value_type", propertyMapValueType(map),
+                "note", "Call save_program to persist this change to the database.",
+                "program", program.getName());
+        if (!errors.isEmpty()) {
+            result.put("errors", errors);
+        }
+        return Response.ok(result);
     }
 
     /**
