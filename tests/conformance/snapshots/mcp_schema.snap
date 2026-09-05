@@ -1,5 +1,5 @@
 {
-  "count": 235,
+  "count": 252,
   "tools": [
     {
       "category": "function",
@@ -473,7 +473,7 @@
     {
       "category": "datatype",
       "category_description": "Struct/enum/union CRUD, apply data types, type conflicts, validation",
-      "description": "Score a global variable's documentation completeness on a budgeted 0-100 scale — the data-address analog of analyze_function_completeness. Six axes: meaningful name, explanatory plate comment, real type, formatted bytes (core, drive effective_score + DOC_DRAFT) plus enum/equate and struct membership (advanced, forgiven in effective_score). Returns raw score, effective_score, COMPLETE_<band>, per-axis breakdown, and which axes are still missing.",
+      "description": "Score a global variable's documentation completeness on a budgeted 0-100 scale — the data-address analog of analyze_function_completeness. Six axes: meaningful name, explanatory plate comment, real type, formatted bytes (core, drive effective_score + DOC_DRAFT) plus enum/equate and struct membership (advanced, forgiven in effective_score). A global with no real type (no defined data, or an undefined* type) is hard-capped at 79 and can never band COMPLETE_80 or above, no matter how good its name and comment are — apply a type with set_global first. Returns raw score, effective_score, COMPLETE_<band>, per-axis breakdown, and which axes are still missing.",
       "method": "GET",
       "params": [
         {
@@ -639,6 +639,87 @@
       "path": "/apply_data_type"
     },
     {
+      "category": "analysis",
+      "category_description": "Completeness analysis, control flow, similarity, crypto detection, memory inspection",
+      "description": "Apply Function ID signature matching on the program. Default is a full-program batch scan (every function hashed once). addresses= optionally limits the application scope to a comma-separated list (lists above 200 are auto-split into <=200 chunks). Matched functions are renamed to <lib>.<symbol> (official FID form, e.g. libcmt._initterm); optional Function ID Analyzer bookmarks and 'Library:' plate comments are written in the same transaction. dry_run=true only reports would-be renames. samples is capped at max_samples with an explicit truncated flag. Per-address failures are reported in errors[], never aborting the batch.",
+      "method": "POST",
+      "params": [
+        {
+          "default": "",
+          "description": "Target program name (omit for active program).",
+          "name": "program",
+          "required": false,
+          "source": "query",
+          "type": "string"
+        },
+        {
+          "default": "",
+          "description": "Comma-separated addresses. Empty = all functions (full-program batch mode). Lists above 200 are split into <=200 chunks and applied independently.",
+          "name": "addresses",
+          "required": false,
+          "source": "query",
+          "type": "string"
+        },
+        {
+          "default": "",
+          "description": "Single-match score threshold. Empty/<=0 falls back to FidService default.",
+          "name": "score_threshold",
+          "required": false,
+          "source": "query",
+          "type": "string"
+        },
+        {
+          "default": "",
+          "description": "Multi-name match threshold; pass-through (FID internal multi-candidate logic uses its own default). Empty/<=0 uses FidService default.",
+          "name": "multi_threshold",
+          "required": false,
+          "source": "query",
+          "type": "string"
+        },
+        {
+          "default": "true",
+          "description": "Always rename matched functions, even ones that already carry a non-FUN_ name. When false, already-user-named functions are left untouched (their match is still counted).",
+          "name": "always_apply_labels",
+          "required": false,
+          "source": "query",
+          "type": "boolean"
+        },
+        {
+          "default": "true",
+          "description": "Write a 'Function ID Analyzer' analysis bookmark at each matched entry point.",
+          "name": "create_bookmarks",
+          "required": false,
+          "source": "query",
+          "type": "boolean"
+        },
+        {
+          "default": "true",
+          "description": "Write a 'Library: <lib>' plate comment at each matched entry point.",
+          "name": "create_plate_comment",
+          "required": false,
+          "source": "query",
+          "type": "boolean"
+        },
+        {
+          "default": "false",
+          "description": "Only report what would be renamed/bookmarked; never write to the program.",
+          "name": "dry_run",
+          "required": false,
+          "source": "query",
+          "type": "boolean"
+        },
+        {
+          "default": "20",
+          "description": "Maximum number of samples to return (>=1). When more matches exist, truncated=true is set; counts stay complete.",
+          "name": "max_samples",
+          "required": false,
+          "source": "query",
+          "type": "integer"
+        }
+      ],
+      "path": "/apply_fid"
+    },
+    {
       "category": "documentation",
       "category_description": "Function hashing, cross-binary documentation, undocumented function discovery",
       "description": "Import documentation to a target function. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution.",
@@ -750,6 +831,31 @@
         }
       ],
       "path": "/archive_ingest_program"
+    },
+    {
+      "category": "headless",
+      "category_description": "Headless server program management (no GUI required)",
+      "description": "Archive the currently open project to a Ghidra-native .gar file. The result can be restored into any Ghidra GUI via File → Restore Project, or back into a headless instance via /restore_project. Captures the entire project (all programs, folders, settings, version-control metadata) — unlike /export_program which ships a single program as .gzf. Output is written to `output_dir/output_name` (defaults: /data/exports and `<project>.gar`). Refuses to overwrite an existing file. Callers should /save_all_programs first to flush pending in-memory edits.",
+      "method": "POST",
+      "params": [
+        {
+          "default": "/data/exports",
+          "description": "Directory the .gar will be written to. Must already exist.",
+          "name": "output_dir",
+          "required": false,
+          "source": "body",
+          "type": "string"
+        },
+        {
+          "default": "",
+          "description": "Output file name. Defaults to `<project>.gar`. `.gar` is appended if missing.",
+          "name": "output_name",
+          "required": false,
+          "source": "body",
+          "type": "string"
+        }
+      ],
+      "path": "/archive_project"
     },
     {
       "category": "datatype",
@@ -880,6 +986,38 @@
         }
       ],
       "path": "/batch_apply_documentation"
+    },
+    {
+      "category": "comment",
+      "category_description": "Set/get plate, decompiler, disassembly, repeatable comments",
+      "description": "Get listing comments (plate/pre/eol/post/repeatable) at MANY addresses in one call. Same per-address shape as get_comment. Pass only_with_comments=true to omit addresses with no comment at all -- the common case for corpus-wide sweeps, where most functions are undocumented and only the documented subset is interesting. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution.",
+      "method": "GET",
+      "params": [
+        {
+          "description": "Comma-separated addresses, each 0x<hex> (default space) or <space>:<hex>.",
+          "name": "addresses",
+          "required": true,
+          "source": "query",
+          "type": "string"
+        },
+        {
+          "default": "false",
+          "description": "If true, omit addresses where has_comment is false -- keeps sweep responses to just the interesting subset.",
+          "name": "only_with_comments",
+          "required": false,
+          "source": "query",
+          "type": "boolean"
+        },
+        {
+          "default": "",
+          "description": "Target program name (omit to use the active program — always specify when multiple programs are open)",
+          "name": "program",
+          "required": false,
+          "source": "query",
+          "type": "string"
+        }
+      ],
+      "path": "/batch_get_comments"
     },
     {
       "category": "function",
@@ -1087,6 +1225,37 @@
       "path": "/check_connection"
     },
     {
+      "category": "headless",
+      "category_description": "Headless server program management (no GUI required)",
+      "description": "Check a program back in to the shared Ghidra Server as a new version (the write-back path GhidraServerManager.checkinFile can't provide — see #119). Requires a shared (server-bound) project opened via /open_project and the file checked out. Saves pending edits and releases the open program first so keep_checked_out=false can actually drop the server checkout. Returns version_before/version/version_bumped.",
+      "method": "POST",
+      "params": [
+        {
+          "description": "Project path of the file (e.g. '/scratch/writetest'); empty uses the current program",
+          "name": "path",
+          "required": true,
+          "source": "body",
+          "type": "string"
+        },
+        {
+          "description": "Checkin comment",
+          "name": "comment",
+          "required": true,
+          "source": "body",
+          "type": "string"
+        },
+        {
+          "default": "false",
+          "description": "Keep the file checked out after the new version lands",
+          "name": "keep_checked_out",
+          "required": false,
+          "source": "body",
+          "type": "boolean"
+        }
+      ],
+      "path": "/checkin_program"
+    },
+    {
       "category": "function",
       "category_description": "Decompile, rename, prototype, variables, batch rename, create/delete functions",
       "description": "Run Ghidra's GUI 'Clear Flow and Repair' action on a seed range: clears instruction flow reachable from the seed, then repairs function bodies and re-disassembles retained flow (ClearFlowAndRepairCmd with clear_data=false, clear_labels=false, repair=true). Use to rebuild regions whose flow was created under wrong assumptions, e.g. a function truncated while a callee was incorrectly marked non-returning. The command follows control flow BEYOND the seed range; the reported observations are seed-local only and do not describe everything the command changed. The flow traversal is not cancellable — a very large connected flow can hold the write lock (GUI: the Swing thread) until it completes. Ghidra treats a seed with exactly one candidate flow start (an instruction that is neither a function entry nor reached by fallthrough from inside the seed) as the flow being intentionally removed and does not reseed that start during repair; consequently, applying this action to otherwise healthy flow can clear code, matching the GUI action's behavior. The response's seed_range.end_address_exclusive is null when the seed ends at its address space's maximum address, since that boundary has no representable exclusive successor. Results are reachability-dependent and the command is not idempotent: some damaged regions may require more than one application to rebuild, while applying it again to healthy flow can clear code — inspect the before/after observations and resulting disassembly after every call.",
@@ -1241,6 +1410,14 @@
         }
       ],
       "path": "/close_program"
+    },
+    {
+      "category": "headless",
+      "category_description": "Headless server program management (no GUI required)",
+      "description": "Close the currently open project",
+      "method": "POST",
+      "params": [],
+      "path": "/close_project"
     },
     {
       "category": "documentation",
@@ -1650,6 +1827,27 @@
         }
       ],
       "path": "/create_pointer_type"
+    },
+    {
+      "category": "headless",
+      "category_description": "Headless server program management (no GUI required)",
+      "description": "Create a new Ghidra project",
+      "method": "POST",
+      "params": [
+        {
+          "name": "parentDir",
+          "required": true,
+          "source": "body",
+          "type": "string"
+        },
+        {
+          "name": "name",
+          "required": true,
+          "source": "body",
+          "type": "string"
+        }
+      ],
+      "path": "/create_project"
     },
     {
       "category": "program",
@@ -2474,14 +2672,23 @@
     {
       "category": "function",
       "category_description": "Decompile, rename, prototype, variables, batch rename, create/delete functions",
-      "description": "Get assembly listing of function. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution.",
+      "description": "Get assembly listing of ONE function (address) OR MANY (functions=comma-separated names/addresses, max 200 per call; over-limit is an error, never silent truncation). Each result carries the same instruction entries as single mode. On programs with multiple address spaces, prefix addresses with the space name (mem:1000).",
       "method": "GET",
       "params": [
         {
-          "description": "Address in the program. Accepts 0x<hex> (default space) or <space>:<hex> (e.g., mem:1000, code:ff00). Note: some programs — particularly embedded/microcontroller targets — are not address-space-agnostic; use get_address_spaces to discover spaces before assuming a plain hex address is unambiguous.",
+          "default": "",
+          "description": "Function address or name (single mode). Omit when using functions=",
           "name": "address",
           "param_type": "address",
-          "required": true,
+          "required": false,
+          "source": "query",
+          "type": "string"
+        },
+        {
+          "default": "",
+          "description": "Bulk mode: comma-separated function references (names or addresses), max 200. When set, address is ignored.",
+          "name": "functions",
+          "required": false,
           "source": "query",
           "type": "string"
         },
@@ -2578,6 +2785,14 @@
         },
         {
           "default": "",
+          "description": "Memory regions to read back AFTER emulation, as a JSON array: [{\"address\": \"0x408300\", \"length\": 16}, ...]. Needed to observe in-place mutations (e.g. a function that lowercases a string via a pointer argument) -- the emulator's memory is an ISOLATED overlay and never touches the real program, so a plain read_memory call after emulation sees only the ORIGINAL unmodified bytes, not the emulated result. This reads from the emulator's own state instead.",
+          "name": "read_memory_after",
+          "required": false,
+          "source": "body",
+          "type": "json"
+        },
+        {
+          "default": "",
           "name": "program",
           "required": false,
           "source": "query",
@@ -2661,6 +2876,38 @@
       "method": "POST",
       "params": [],
       "path": "/exit_ghidra"
+    },
+    {
+      "category": "headless",
+      "category_description": "Headless server program management (no GUI required)",
+      "description": "Export a program to a GZF (Ghidra packed-database) file on disk. The resulting .gzf can be imported into any Ghidra GUI (File → Import) or back into a project via /import_program. Resolution order: (1) the in-memory program with that name (captures live analyst edits); (2) a DomainFile in the open project (on-disk state). Output is written to `output_dir/output_name` (defaults: /data/exports and `<program>.gzf`). Refuses to overwrite an existing file.",
+      "method": "POST",
+      "params": [
+        {
+          "description": "Program name or project path (e.g. 'myprog' or '/myprog').",
+          "name": "program_name",
+          "required": true,
+          "source": "body",
+          "type": "string"
+        },
+        {
+          "default": "/data/exports",
+          "description": "Directory the .gzf will be written to. Must already exist.",
+          "name": "output_dir",
+          "required": false,
+          "source": "body",
+          "type": "string"
+        },
+        {
+          "default": "",
+          "description": "Output file name. Defaults to `<program>.gzf`. `.gzf` is appended if missing.",
+          "name": "output_name",
+          "required": false,
+          "source": "body",
+          "type": "string"
+        }
+      ],
+      "path": "/export_program"
     },
     {
       "category": "malware",
@@ -3814,6 +4061,14 @@
       "path": "/get_program_options"
     },
     {
+      "category": "headless",
+      "category_description": "Headless server program management (no GUI required)",
+      "description": "Get info about the currently open project, including server-binding state. A shared (server-bound) project is required for /server/version_control/checkout to deliver content the headless can open; if `project_server_bound` is false, the open project is local-only.",
+      "method": "GET",
+      "params": [],
+      "path": "/get_project_info"
+    },
+    {
       "category": "program",
       "category_description": "Program management, script execution, memory read, bookmarks, save",
       "description": "Read the value stored at an address in a property map. Returns has_value=false and a null value when the address holds no property.",
@@ -3926,14 +4181,22 @@
     {
       "category": "xref",
       "category_description": "Cross-references, call graphs, incoming/outgoing calls, data refs",
-      "description": "Get cross-references from an address. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution.",
+      "description": "Get cross-references FROM ONE address OR MANY (addresses=comma-separated, max 200 per call; over-limit is an error, never silent truncation). Bulk mode returns every reference per address (offset/limit ignored). On programs with multiple address spaces, prefix addresses with the space name (mem:1000).",
       "method": "GET",
       "params": [
         {
-          "description": "Address in the program. Accepts 0x<hex> (default space) or <space>:<hex> (e.g., mem:1000, code:ff00). Note: some programs — particularly embedded/microcontroller targets — are not address-space-agnostic; use get_address_spaces to discover spaces before assuming a plain hex address is unambiguous.",
+          "description": "Address (single mode). Accepts 0x<hex> or <space>:<hex> (e.g., mem:1000, code:ff00). Note: some programs — particularly embedded/microcontroller targets — are not address-space-agnostic; use get_address_spaces to discover spaces before assuming a plain hex address is unambiguous. Omit when using addresses=",
           "name": "address",
           "param_type": "address",
           "required": true,
+          "source": "query",
+          "type": "string"
+        },
+        {
+          "default": "",
+          "description": "Bulk mode: comma-separated addresses, max 200. When set, address/offset/limit are ignored.",
+          "name": "addresses",
+          "required": false,
           "source": "query",
           "type": "string"
         },
@@ -4077,6 +4340,46 @@
         }
       ],
       "path": "/import_file"
+    },
+    {
+      "category": "headless",
+      "category_description": "Headless server program management (no GUI required)",
+      "description": "Import a GZF (Ghidra packed-database) file into the open project. The GZF must already exist on disk at `gzf_path` (typically staged on a shared volume by the orchestrator). Lands at `target_folder/target_name` (defaults: `/` and the GZF basename sans `.gzf`). Set `overwrite=true` to replace an existing program at the destination; otherwise the call fails on collision.",
+      "method": "POST",
+      "params": [
+        {
+          "description": "Absolute path to the .gzf file on disk.",
+          "name": "gzf_path",
+          "required": true,
+          "source": "body",
+          "type": "string"
+        },
+        {
+          "default": "/",
+          "description": "Destination folder in the project. Intermediate folders are created.",
+          "name": "target_folder",
+          "required": false,
+          "source": "body",
+          "type": "string"
+        },
+        {
+          "default": "",
+          "description": "Destination file name in the project. Defaults to the GZF basename sans `.gzf`.",
+          "name": "target_name",
+          "required": false,
+          "source": "body",
+          "type": "string"
+        },
+        {
+          "default": "false",
+          "description": "When true, delete any existing program at the destination before importing.",
+          "name": "overwrite",
+          "required": false,
+          "source": "body",
+          "type": "boolean"
+        }
+      ],
+      "path": "/import_program"
     },
     {
       "category": "analysis",
@@ -4899,6 +5202,45 @@
     {
       "category": "listing",
       "category_description": "Enumerate functions, strings, segments, imports, exports, namespaces, classes, data items",
+      "description": "List named global DATA symbols that have NO type of their own because a larger data unit starting at an earlier address covers them. These are invisible to /list_globals — it resolves the CONTAINING unit, so it reports the covering neighbour's type at the shadowed address and the global looks perfectly typed. Each record carries the container that swallowed it. Use this to find documentation that a neighbouring type application destroyed, or a symbol sitting inside an array where it does not belong.",
+      "method": "GET",
+      "params": [
+        {
+          "default": "0",
+          "name": "offset",
+          "required": false,
+          "source": "query",
+          "type": "integer"
+        },
+        {
+          "default": "500",
+          "name": "limit",
+          "required": false,
+          "source": "query",
+          "type": "integer"
+        },
+        {
+          "default": "false",
+          "description": "By default only data sections are scanned, matching list_globals.",
+          "name": "include_all_sections",
+          "required": false,
+          "source": "query",
+          "type": "boolean"
+        },
+        {
+          "default": "",
+          "description": "Target program name (omit to use the active program)",
+          "name": "program",
+          "required": false,
+          "source": "query",
+          "type": "string"
+        }
+      ],
+      "path": "/list_shadowed_globals"
+    },
+    {
+      "category": "listing",
+      "category_description": "Enumerate functions, strings, segments, imports, exports, namespaces, classes, data items",
       "description": "List defined strings with optional filter",
       "method": "GET",
       "params": [
@@ -4934,6 +5276,54 @@
         }
       ],
       "path": "/list_strings"
+    },
+    {
+      "category": "headless",
+      "category_description": "Headless server program management (no GUI required)",
+      "description": "Load a binary file into the headless server for analysis. For raw firmware (no recognizable header), pass `language` (e.g. 'ARM:LE:32:Cortex') and optionally `compiler_spec` (e.g. 'default'); the file is then imported as raw binary with the requested processor. When `language` is omitted, the loader auto-detects the format.",
+      "method": "POST",
+      "params": [
+        {
+          "description": "Absolute path to the binary file",
+          "name": "file",
+          "required": true,
+          "source": "body",
+          "type": "string"
+        },
+        {
+          "default": "",
+          "description": "Optional Ghidra language ID for raw binaries (e.g. 'ARM:LE:32:Cortex', 'x86:LE:64:default'). Leave empty to auto-detect.",
+          "name": "language",
+          "required": false,
+          "source": "body",
+          "type": "string"
+        },
+        {
+          "default": "",
+          "description": "Optional compiler-spec ID (e.g. 'default', 'gcc', 'windows'). Only consulted when `language` is set; falls back to the language default when empty.",
+          "name": "compiler_spec",
+          "required": false,
+          "source": "body",
+          "type": "string"
+        }
+      ],
+      "path": "/load_program"
+    },
+    {
+      "category": "headless",
+      "category_description": "Headless server program management (no GUI required)",
+      "description": "Load a program from the open project. Returns structured diagnostics on failure (available paths, server-binding state) so the operator can tell server-side-checkout-but-not-shared from path-typo from server-unreachable. See discussion #119.",
+      "method": "POST",
+      "params": [
+        {
+          "description": "Program path within the project",
+          "name": "path",
+          "required": true,
+          "source": "body",
+          "type": "string"
+        }
+      ],
+      "path": "/load_program_from_project"
     },
     {
       "category": "utility",
@@ -5090,6 +5480,52 @@
       "path": "/move_data_type_to_category"
     },
     {
+      "category": "project",
+      "category_description": "Program management, script execution, memory read, bookmarks, save",
+      "description": "Move a program file to a different folder in the project, preserving all analysis and documentation. Refuses when the program has unsaved changes -- call save_program first -- rather than discarding them. A program that is open but clean is closed, moved, then reopened at its new path.",
+      "method": "POST",
+      "params": [
+        {
+          "description": "Project file path to move, e.g. /Vanilla/1.00/D2Server.dll",
+          "name": "filePath",
+          "required": true,
+          "source": "body",
+          "type": "string"
+        },
+        {
+          "description": "Destination project folder path, e.g. /Mods/PD2-S12",
+          "name": "destFolder",
+          "required": true,
+          "source": "body",
+          "type": "string"
+        }
+      ],
+      "path": "/move_file"
+    },
+    {
+      "category": "project",
+      "category_description": "Program management, script execution, memory read, bookmarks, save",
+      "description": "Move a project folder (and everything under it) into another folder. Refuses to move a folder into itself or into its own descendant, which would orphan the subtree.",
+      "method": "POST",
+      "params": [
+        {
+          "description": "Project folder path to move, e.g. /Vanilla/1.00",
+          "name": "sourcePath",
+          "required": true,
+          "source": "body",
+          "type": "string"
+        },
+        {
+          "description": "Destination parent folder path, e.g. /Mods",
+          "name": "destPath",
+          "required": true,
+          "source": "body",
+          "type": "string"
+        }
+      ],
+      "path": "/move_folder"
+    },
+    {
       "category": "program",
       "category_description": "Program management, script execution, memory read, bookmarks, save",
       "description": "Open a program from the current project",
@@ -5112,6 +5548,21 @@
         }
       ],
       "path": "/open_program"
+    },
+    {
+      "category": "headless",
+      "category_description": "Headless server program management (no GUI required)",
+      "description": "Open an existing Ghidra project (.gpr file or directory)",
+      "method": "POST",
+      "params": [
+        {
+          "name": "path",
+          "required": true,
+          "source": "body",
+          "type": "string"
+        }
+      ],
+      "path": "/open_project"
     },
     {
       "category": "headless",
@@ -5675,6 +6126,37 @@
         }
       ],
       "path": "/resolve_duplicate_type"
+    },
+    {
+      "category": "headless",
+      "category_description": "Headless server program management (no GUI required)",
+      "description": "Restore a Ghidra .gar archive into a fresh on-disk project at `parent_dir/project_name`. Closes any currently-open project first. The restored project is NOT re-opened automatically; follow up with /open_project so owner reset and project bookkeeping run via the same code path as a user-driven open. Fails loudly if the destination project already exists.",
+      "method": "POST",
+      "params": [
+        {
+          "description": "Absolute path to the .gar file on disk.",
+          "name": "gar_path",
+          "required": true,
+          "source": "body",
+          "type": "string"
+        },
+        {
+          "default": "/data/ghidra_projects",
+          "description": "Directory under which the new project (project_name.gpr + project_name.rep/) will be created.",
+          "name": "parent_dir",
+          "required": false,
+          "source": "body",
+          "type": "string"
+        },
+        {
+          "description": "Name of the new project to create from the archive.",
+          "name": "project_name",
+          "required": true,
+          "source": "body",
+          "type": "string"
+        }
+      ],
+      "path": "/restore_project"
     },
     {
       "category": "analysis",
@@ -6351,6 +6833,14 @@
     },
     {
       "category": "headless",
+      "category_description": "Headless server program management (no GUI required)",
+      "description": "Check headless server connection status",
+      "method": "GET",
+      "params": [],
+      "path": "/server/status"
+    },
+    {
+      "category": "headless",
       "description": "Check headless server connection status",
       "method": "GET",
       "params": [],
@@ -6522,11 +7012,11 @@
     {
       "category": "comment",
       "category_description": "Set/get plate, decompiler, disassembly, repeatable comments",
-      "description": "Set a listing comment of a given kind at ANY address (data or code). type = plate|pre|eol|post|repeatable (aliases: decompiler=pre, disassembly=eol). Plate writes surface structural warnings and flush the decompiler cache. Symmetric writer for get_comment; replaces the former set_plate_comment / set_decompiler_comment / set_disassembly_comment.",
+      "description": "Set a listing comment of a given kind at ANY address (data or code). type = plate|pre|eol|post|repeatable (aliases: decompiler=pre, disassembly=eol). Plate writes surface structural warnings and flush the decompiler cache. Symmetric writer for get_comment; replaces the former set_plate_comment / set_decompiler_comment / set_disassembly_comment. Bulk mode: pass entries=[{address, comment, type?}, ...] to set many comments in one transaction.",
       "method": "POST",
       "params": [
         {
-          "description": "Address in the program (data or code). 0x<hex> or <space>:<hex>.",
+          "description": "Address in the program (data or code). 0x<hex> or <space>:<hex>. Ignored when entries is non-empty.",
           "name": "address",
           "param_type": "address",
           "required": true,
@@ -6535,7 +7025,7 @@
         },
         {
           "allow_empty": true,
-          "description": "Comment text. An empty string clears this comment kind at the address.",
+          "description": "Comment text. An empty string clears this comment kind at the address. Ignored when entries is non-empty.",
           "name": "comment",
           "required": true,
           "source": "body",
@@ -6543,11 +7033,19 @@
         },
         {
           "default": "plate",
-          "description": "Comment kind: plate | pre | eol | post | repeatable (default plate)",
+          "description": "Comment kind: plate | pre | eol | post | repeatable (default plate). Ignored when entries is non-empty.",
           "name": "type",
           "required": false,
           "source": "body",
           "type": "string"
+        },
+        {
+          "default": "[]",
+          "description": "Bulk mode: array of {address, comment, type} objects. When non-empty, address/comment/type params are ignored and every entry is written in a single transaction.",
+          "name": "entries",
+          "required": false,
+          "source": "body",
+          "type": "array"
         },
         {
           "default": "",
@@ -6748,6 +7246,14 @@
           "required": false,
           "source": "body",
           "type": "string"
+        },
+        {
+          "default": "false",
+          "description": "Permit this type application to clear NAMED neighbouring globals out of existence. Default false: the call is rejected with `type_would_evict` plus the list of globals it would destroy. Only set true when the overlap is genuinely wrong and the other symbol should go — the default exists because a silent clear deletes another global's documentation and still reports success.",
+          "name": "allow_evict",
+          "required": false,
+          "source": "body",
+          "type": "boolean"
         }
       ],
       "path": "/set_global"
@@ -6823,7 +7329,7 @@
     {
       "category": "program",
       "category_description": "Program management, script execution, memory read, bookmarks, save",
-      "description": "Set a value at an address in a property map. The value is coerced to the map's type (int/long/string); 'void' maps ignore the value and just tag the address. Create the map first with create_property_map. Call save_program to persist.",
+      "description": "Set ONE property at an address in a property map OR MANY in one transaction (entries=[{address,value}, ...]). The value is coerced to the map's type (int/long/string); 'void' maps ignore the value and just tag the address. Create the map first with create_property_map. Call save_program to persist.",
       "method": "POST",
       "params": [
         {
@@ -6834,20 +7340,29 @@
           "type": "string"
         },
         {
-          "description": "Address in the program. Accepts 0x<hex> (default space) or <space>:<hex> (e.g., mem:1000, code:ff00). Note: some programs — particularly embedded/microcontroller targets — are not address-space-agnostic; use get_address_spaces to discover spaces before assuming a plain hex address is unambiguous.",
+          "default": "",
+          "description": "Address (single mode). Omit when using entries[].",
           "name": "address",
           "param_type": "address",
-          "required": true,
+          "required": false,
           "source": "body",
           "type": "string"
         },
         {
           "default": "",
-          "description": "Value to store, as a string; parsed per the map's type. Ignored for 'void' maps.",
+          "description": "Value to store, as a string; parsed per the map's type. Ignored for 'void' maps. (single mode).",
           "name": "value",
           "required": false,
           "source": "body",
           "type": "string"
+        },
+        {
+          "default": "[]",
+          "description": "Bulk mode: array of {address, value} objects. When non-empty, address/value params are ignored.",
+          "name": "entries",
+          "required": false,
+          "source": "body",
+          "type": "array"
         },
         {
           "default": "",

@@ -2,6 +2,8 @@
 
 > 目标仓库：`E:\_UKUCLOUD.WORK\ghidra-mcp`（dev 分支，GhidraMCP 7.x 演化版）
 > 此文档由分析会话审计产出、经 2026-09-05 审核收敛，供实现会话使用。
+>
+> **状态：已实现并审核通过（2026-09-05，提交 8fb225a）。** 审核结论见文末第 10 节。
 > 结论依据：git 提交历史 + 当前源码实读 + `tests/endpoints.json`（仓库权威目录，`total_endpoints=254`）。
 > 注：此前记录"线上插件实时 schema 239 tools"与仓库计数不一致（疑似线上实例为旧构建/口径不同），一律以
 > `tests/endpoints.json`（254）与 `EndpointsJsonParityTest` 为准。
@@ -173,3 +175,38 @@ stage2 16,639 条 → 34 批；单事务保持小且可观测。`SecurityConfig.
 6. 补充 `dispatch.py` 的 `_normalize_post_payload` 需求与顺序依赖（先归并后算超时）。
 7. 明确批量写入线程模型：必须 `ThreadingStrategy.executeWrite`（headless/GUI 双模式对等），
    不复用存量注释代码的手写 `startTransaction`。
+## 10. 审核结论（2026-09-05，实现后复审）
+
+**结论：8fb225a 完整实现第 3/4/5 节契约与第 7 节全部 5 个变更文件，验收 1–5、7 通过；验收 6（性能）待 relike 侧接入批量后实测。**
+
+逐项核对：
+
+- 契约（第 3 节）：`entries=[{address, comment, type?}]`、非空时忽略单点参数、500 限额显式
+  `Response.err`、空串清除、type 别名映射——均与 `CommentService.setComment`/`batchSetCommentEntries`
+  实现一致。响应含 `success/entries_set/entries_failed/plate_comments/program/errors?/warnings?`，
+  无 `note: save_program`（符合第 4 节修正）。
+- 线程模型：`ThreadingStrategy.executeWrite(program, "Batch Set Comments", ...)` ✓；
+  未复制手写 `startTransaction` 与 500ms sleep ✓；事务后 `flushEvents`（有写入才刷）✓；
+  plate 结构警告带地址前缀聚合 ✓。
+- Headless 对等：`HeadlessEndpointHandler` 两处调用适配 5 参签名 ✓。
+- dispatch.py：`get_timeout` set_comment 分支（镜像 set_property）、
+  `_coerce_comment_entries_with_type` 保留 per-entry type、归并先于超时计算 ✓。
+- `tests/endpoints.json` 同步 entries 参数，`EndpointsJsonParityTest` OK (5 tests) ✓。
+
+补充执行（本轮审核会话完成）：
+
+1. **test_gradle_tasks.py 环境失败修复**：原 GBK 解码崩溃只是表象，真实根因是裸 shell 无
+   JAVA_HOME 且 gradle 分发包无法经 TLS 引导（PKIX）。修复：测试自行定位 JDK
+   （JAVA_HOME → PATH → 常见安装根目录，镜像 build.bat Find-Jdk）、subprocess 加
+   `encoding="utf-8", errors="replace"`、`gradlew --version` 探测不可用时 skip
+   （对齐套件既有平台 skip 惯例；权威构建路径 build.bat 本就不依赖 gradle）。
+   至此 `pytest tests/unit/` 不带任何排除项也全绿（gradle 用例转为环境 skip）。
+2. **mcp_schema.snap 同步（提前于"下次联调"完成）**：活插件仍为旧构建，改用离线路径——
+   新增 build/SchemaDump（未入库）经 `AnnotationScanner.generateSchema()` 从当前源码
+   生成权威 schema，按 runner.normalize() 归一化后写入快照。count 235 → 252
+   （GUI 插件 schema；差的 4 个 `/configure_analyzer`、`/delete_project`、`/health`、
+   `/list_projects` 为 headless 独有 manual 路由，GUI schema 本就不含）。
+   顺带修复 offline `ServiceFactory` 漏装 `PromptPolicyService`（插件实际装配，
+   缺它则 `/prompt_policy` 从扫描中消失）。**快照与新构建的部署后 schema 一致性
+   将在下一次真实联调时由 conformance suite 复核。**
+3. relike 客户端 `set_comments_batch()` 不在本仓库，仍待 relike 侧实现（见第 8 节）。

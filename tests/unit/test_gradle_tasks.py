@@ -8,6 +8,9 @@ requiring GHIDRA_INSTALL_DIR.  They are intentionally slow — deselect with
 """
 from __future__ import annotations
 
+import functools
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -18,14 +21,71 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 GRADLEW = REPO_ROOT / ("gradlew.bat" if sys.platform == "win32" else "gradlew")
 
 
+@functools.lru_cache(maxsize=1)
+def _gradlew_probe_rc() -> int:
+    """Run `gradlew --version` once per session; rc!=0 means the wrapper
+    itself cannot start (no JDK / undownloadable distribution)."""
+    return _run_gradlew("--version").returncode
+
+
+@pytest.fixture(autouse=True)
+def _gradle_usable():
+    if shutil.which("java") is None and _find_java_home() is None:
+        pytest.skip("no JDK found (set JAVA_HOME or install to D:\\jdk / Program Files\\Java)")
+    # Gradle bootstrap needs to fetch its distribution over TLS; on locked-down
+    # networks (PKIX failures) or offline boxes the wrapper can't start at all.
+    # The canonical build path is build.bat (javac, no gradle), so treat an
+    # unusable wrapper as an environment skip, like the other platform guards.
+    if _gradlew_probe_rc() != 0:
+        pytest.skip("gradlew unusable in this environment (distribution bootstrap failed)")
+
+
+def _find_java_home() -> str | None:
+    """Locate a JDK for the gradlew subprocess.
+
+    gradlew.bat exits rc=9009 when neither JAVA_HOME nor a PATH java exists
+    (a bare CI/shell on Windows), and the repo's own build.bat compensates
+    with the same probe list. Mirror it: inherit JAVA_HOME when valid, else
+    PATH, else common JDK install roots (newest first)."""
+    candidates: list[str] = []
+    env_home = os.environ.get("JAVA_HOME", "")
+    if env_home and (Path(env_home) / "bin" / "java.exe").exists():
+        return env_home
+    if shutil.which("java"):
+        return None  # gradlew finds it via PATH on its own
+    for root in ("D:\\jdk", "C:\\Program Files\\Java",
+                 "C:\\Program Files\\Eclipse Adoptium"):
+        base = Path(root)
+        if base.is_dir():
+            candidates.extend(
+                str(p) for p in sorted(base.iterdir(), reverse=True)
+                if (p / "bin" / "java.exe").exists()
+            )
+    return candidates[0] if candidates else None
+
+
+def _gradlew_env() -> dict[str, str] | None:
+    java_home = _find_java_home()
+    if java_home is None:
+        return None  # None = inherit parent env unchanged
+    env = dict(os.environ)
+    env["JAVA_HOME"] = java_home
+    return env
+
+
 def _run_gradlew(*args: str, timeout: int = 120) -> subprocess.CompletedProcess:
+    # errors="replace": the Gradle/JVM console stream on zh-CN Windows is GBK,
+    # while Python decodes it as UTF-8 — undecodable banner bytes must not kill
+    # the reader thread. Assertions below only match ASCII task/version text.
     return subprocess.run(
         [str(GRADLEW), *args],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
-        env=None,  # inherit — no GHIDRA_INSTALL_DIR needed for these tasks
+        env=_gradlew_env(),
     )
 
 
@@ -89,12 +149,17 @@ def test_gradlew_verify_version_without_ghidra_dir():
     """verifyVersion should succeed without GHIDRA_INSTALL_DIR (prints skip message)."""
     import os
 
-    env = {k: v for k, v in __import__("os").environ.items() if k != "GHIDRA_INSTALL_DIR"}
+    env = {k: v for k, v in os.environ.items() if k != "GHIDRA_INSTALL_DIR"}
+    java_home = _find_java_home()
+    if java_home is not None:
+        env["JAVA_HOME"] = java_home
     result = subprocess.run(
         [str(GRADLEW), "verifyVersion"],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=120,
         env=env,
     )

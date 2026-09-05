@@ -58,6 +58,12 @@ public final class ServiceFactory {
         // method signatures, so a null tool is safe for offline scanning.
         DebuggerService debuggerService = new DebuggerService(provider, ts, null);
 
+        // The plugin instantiates this one outside the provider/strategy wiring
+        // (GhidraMCPPlugin ctor); without it /prompt_policy goes missing from
+        // the offline schema scan.
+        com.xebyte.core.PromptPolicyService promptPolicyService =
+            new com.xebyte.core.PromptPolicyService();
+
         return new Object[] {
             listingService,
             functionService,
@@ -72,6 +78,7 @@ public final class ServiceFactory {
             emulationService,
             headlessManagementService,
             debuggerService,
+            promptPolicyService,
         };
     }
 
