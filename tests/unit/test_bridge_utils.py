@@ -1344,6 +1344,43 @@ class TestGetTimeout(unittest.TestCase):
         payload = {"map": "flags", "address": "0x1000", "value": "1"}
         self.assertEqual(get_timeout("/set_property", payload), 30)
 
+    def test_set_comment_bulk_entries_scaling(self):
+        from bridge_mcp_ghidra import get_timeout
+
+        payload = {"entries": [{"address": "0x1000", "comment": "hi", "type": "plate"}] * 10}
+        timeout = get_timeout("/set_comment", payload)
+        self.assertGreater(timeout, 30)
+
+    def test_set_comment_single_no_scaling(self):
+        from bridge_mcp_ghidra import get_timeout
+
+        self.assertEqual(
+            get_timeout("/set_comment", {"address": "0x1000", "comment": "hi"}), 30
+        )
+
+    def test_set_comment_entries_coercion_preserves_type(self):
+        from bridge_mcp_ghidra.dispatch import _normalize_post_payload
+
+        payload = {
+            "entries": '[{"address": "0x1000", "comment": "a", "type": "plate"},'
+                       ' {"address": "0x1001", "comment": "b", "type": "pre"}]'
+        }
+        normalized = _normalize_post_payload("/set_comment", payload)
+        self.assertEqual(
+            normalized["entries"],
+            [
+                {"address": "0x1000", "comment": "a", "type": "plate"},
+                {"address": "0x1001", "comment": "b", "type": "pre"},
+            ],
+        )
+
+    def test_set_comment_entries_coercion_drops_unaddressed(self):
+        from bridge_mcp_ghidra.dispatch import _normalize_post_payload
+
+        payload = {"entries": [{"comment": "no address"}, {"address": "0x1000", "comment": "ok"}]}
+        normalized = _normalize_post_payload("/set_comment", payload)
+        self.assertEqual(normalized["entries"], [{"address": "0x1000", "comment": "ok"}])
+
     def test_disassemble_function_bulk_scaling(self):
         from bridge_mcp_ghidra import get_timeout
 

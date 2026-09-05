@@ -316,11 +316,11 @@ public class HeadlessEndpointHandler {
     // ==========================================================================
 
     public String setDecompilerComment(String addressStr, String comment, String programName) {
-        return commentService.setComment(addressStr, comment, "pre", programName).toJson();
+        return commentService.setComment(addressStr, comment, "pre", null, programName).toJson();
     }
 
     public String setDisassemblyComment(String addressStr, String comment, String programName) {
-        return commentService.setComment(addressStr, comment, "eol", programName).toJson();
+        return commentService.setComment(addressStr, comment, "eol", null, programName).toJson();
     }
 
     // ==========================================================================

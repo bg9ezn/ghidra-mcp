@@ -77,6 +77,21 @@ with an explicit `truncated` flag; per-address failures land in `errors[]` and
 never abort the batch. `multi_threshold` is passed through to the FID service
 for multi-candidate matches. `total_endpoints` 253 → 254.
 
+**Single/batch (new capability: bulk comment writes).** `set_comment` now
+accepts a bulk `entries=[{address, comment, type?}, ...]` array in addition to
+the single `address`+`comment`+`type` form, writing every entry in **one**
+transaction via the shared `ThreadingStrategy.executeWrite` path — the same
+one-or-many pattern as `set_property`/`create_label`. Per-entry failures
+(missing field, unparseable address, unknown type, write error) land in
+`errors[]` + `entries_failed` and never abort the batch; plate writes keep the
+single-point semantics (decompiler-cache flush + aggregated structural
+warnings). `entries` is capped at **500** per call — exceeding it is an
+explicit error, never a silent truncation — so a 16,639-plate relike stage2
+sweep becomes ~34 requests instead of 16,639 serial round trips. The Python
+bridge scales its request timeout by the entries count and coerces
+MCP-supplied `entries` JSON (preserving per-entry `type`) before dispatch.
+`total_endpoints` stays 254 (no new endpoint).
+
 **True duplicates (−4).** `get_data_type_size` → `get_type_size` (a strict
 superset: adds alignment + path); `validate_data_type_exists` →
 `validate_data_type` with `address` now optional;

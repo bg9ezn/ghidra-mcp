@@ -31,6 +31,11 @@ public class CommentService {
             .serializeNulls()
             .create();
 
+    // Cap on set_comment(entries=[...]) bulk size. Keeps a single Ghidra
+    // transaction small and observable; clients page through larger sets
+    // (e.g. relike stage2: 16,639 plates at 500/batch = 34 requests).
+    private static final int MAX_SET_COMMENT_ENTRIES = 500;
+
     private final ProgramProvider programProvider;
     private final ThreadingStrategy threadingStrategy;
 
@@ -235,27 +240,134 @@ public class CommentService {
      * including data globals. Unlike set_plate_comment (function-only), this can set a PLATE
      * comment on a data global via Listing.setComment.
      */
-    @McpTool(path = "/set_comment", method = "POST", description = "Set a listing comment of a given kind at ANY address (data or code). type = plate|pre|eol|post|repeatable (aliases: decompiler=pre, disassembly=eol). Plate writes surface structural warnings and flush the decompiler cache. Symmetric writer for get_comment; replaces the former set_plate_comment / set_decompiler_comment / set_disassembly_comment.", category = "comment")
+    @McpTool(path = "/set_comment", method = "POST", description = "Set a listing comment of a given kind at ANY address (data or code). type = plate|pre|eol|post|repeatable (aliases: decompiler=pre, disassembly=eol). Plate writes surface structural warnings and flush the decompiler cache. Symmetric writer for get_comment; replaces the former set_plate_comment / set_decompiler_comment / set_disassembly_comment. Bulk mode: pass entries=[{address, comment, type?}, ...] to set many comments in one transaction.", category = "comment")
     public Response setComment(
             @Param(value = "address", paramType = "address", source = ParamSource.BODY,
-                   description = "Address in the program (data or code). 0x<hex> or <space>:<hex>.") String addressStr,
+                   description = "Address in the program (data or code). 0x<hex> or <space>:<hex>. Ignored when entries is non-empty.") String addressStr,
             @Param(value = "comment", source = ParamSource.BODY, allowEmpty = true,
-                   description = "Comment text. An empty string clears this comment kind at the address.") String comment,
+                   description = "Comment text. An empty string clears this comment kind at the address. Ignored when entries is non-empty.") String comment,
             @Param(value = "type", source = ParamSource.BODY, defaultValue = "plate",
-                   description = "Comment kind: plate | pre | eol | post | repeatable (default plate)") String type,
+                   description = "Comment kind: plate | pre | eol | post | repeatable (default plate). Ignored when entries is non-empty.") String type,
+            @Param(value = "entries", source = ParamSource.BODY, defaultValue = "[]",
+                   description = "Bulk mode: array of {address, comment, type} objects. When non-empty, address/comment/type params are ignored and every entry is written in a single transaction.") List<Map<String, String>> entries,
             @Param(value = "program", description = "Target program name (omit to use the active program)", defaultValue = "") String programName) {
+        if (entries != null && !entries.isEmpty()) {
+            return batchSetCommentEntries(entries, programName);
+        }
         String t = (type == null || type.trim().isEmpty()) ? "plate" : type.trim().toLowerCase();
-        int ct;
-        switch (t) {
-            case "plate":                 ct = CodeUnit.PLATE_COMMENT;      break;
-            case "pre": case "decompiler": ct = CodeUnit.PRE_COMMENT;        break;
-            case "eol": case "disassembly": ct = CodeUnit.EOL_COMMENT;       break;
-            case "post":                  ct = CodeUnit.POST_COMMENT;       break;
-            case "repeatable":            ct = CodeUnit.REPEATABLE_COMMENT; break;
-            default:
-                return Response.err("Unknown comment type: " + type + " (use plate|pre|eol|post|repeatable)");
+        int ct = commentTypeCode(t);
+        if (ct == -1) {
+            return Response.err(unknownCommentTypeMessage(type));
         }
         return setCommentAtAddress(addressStr, comment, ct, "Set " + t + " comment", programName);
+    }
+
+    /**
+     * Bulk helper for set_comment(entries=[{address, comment, type?}, ...]).
+     * One HTTP call = one Ghidra transaction; per-entry failures are tracked
+     * without aborting the batch (mirrors set_property's batchSetProperty).
+     * Returns entries_set/entries_failed plus aggregated plate-structure warnings.
+     */
+    public Response batchSetCommentEntries(List<Map<String, String>> entries, String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        if (entries == null || entries.isEmpty()) return Response.err("No entries provided");
+
+        if (entries.size() > MAX_SET_COMMENT_ENTRIES) {
+            return Response.err("Too many entries (" + entries.size() + "); max is "
+                    + MAX_SET_COMMENT_ENTRIES + " per call. Split into batches of at most "
+                    + MAX_SET_COMMENT_ENTRIES + " entries.");
+        }
+
+        final AtomicInteger successCount = new AtomicInteger(0);
+        final AtomicInteger errorCount = new AtomicInteger(0);
+        final AtomicInteger plateCount = new AtomicInteger(0);
+        final List<String> errors = new java.util.ArrayList<>();
+        final List<String> plateWarnings = new java.util.ArrayList<>();
+
+        try {
+            threadingStrategy.executeWrite(program, "Batch Set Comments", () -> {
+                for (Map<String, String> entry : entries) {
+                    String addressStr = entry.get("address");
+                    if (addressStr == null || addressStr.isEmpty()) {
+                        errors.add("Missing 'address' in entry");
+                        errorCount.incrementAndGet();
+                        continue;
+                    }
+                    Address address = ServiceUtils.parseAddress(program, addressStr);
+                    if (address == null) {
+                        errors.add(addressStr + ": " + ServiceUtils.getLastParseError());
+                        errorCount.incrementAndGet();
+                        continue;
+                    }
+                    String comment = entry.get("comment");
+                    if (comment == null) {
+                        errors.add("Missing 'comment' for " + addressStr);
+                        errorCount.incrementAndGet();
+                        continue;
+                    }
+                    String entryType = entry.getOrDefault("type", "plate");
+                    int ct = commentTypeCode(entryType);
+                    if (ct == -1) {
+                        errors.add(addressStr + ": " + unknownCommentTypeMessage(entryType));
+                        errorCount.incrementAndGet();
+                        continue;
+                    }
+                    try {
+                        program.getListing().setComment(address, ct, comment.isEmpty() ? null : comment);
+                        if (ct == CodeUnit.PLATE_COMMENT) {
+                            plateCount.incrementAndGet();
+                            if (!comment.isEmpty()) {
+                                for (String w : NamingConventions.validatePlateCommentStructure(comment)) {
+                                    plateWarnings.add(addressStr + ": " + w);
+                                }
+                            }
+                        }
+                        successCount.incrementAndGet();
+                    } catch (Exception e) {
+                        errors.add("Error at " + addressStr + ": " + e.getMessage());
+                        errorCount.incrementAndGet();
+                    }
+                }
+                return null;
+            });
+        } catch (Exception e) {
+            return Response.err("Batch transaction failed: " + e.getMessage());
+        }
+
+        if (successCount.get() > 0) {
+            program.flushEvents();
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("success", true);
+        result.put("entries_set", successCount.get());
+        result.put("entries_failed", errorCount.get());
+        result.put("plate_comments", plateCount.get());
+        result.put("program", program.getName());
+        if (!errors.isEmpty()) result.put("errors", errors);
+        if (!plateWarnings.isEmpty()) result.put("warnings", plateWarnings);
+        return Response.ok(result);
+    }
+
+    private static int commentTypeCode(String t) {
+        String s = (t == null || t.trim().isEmpty()) ? "plate" : t.trim().toLowerCase();
+        switch (s) {
+            case "plate":                     return CodeUnit.PLATE_COMMENT;
+            case "pre":
+            case "decompiler":                return CodeUnit.PRE_COMMENT;
+            case "eol":
+            case "disassembly":               return CodeUnit.EOL_COMMENT;
+            case "post":                      return CodeUnit.POST_COMMENT;
+            case "repeatable":                return CodeUnit.REPEATABLE_COMMENT;
+            default:                          return -1;
+        }
+    }
+
+    private static String unknownCommentTypeMessage(String type) {
+        return "Unknown comment type: " + type + " (use plate|pre|eol|post|repeatable)";
     }
 
     /**

@@ -2542,9 +2542,10 @@
         "address",
         "comment",
         "type",
+        "entries",
         "program"
       ],
-      "description": "Set a listing comment of a given kind (plate/pre/eol/post/repeatable) at ANY address, including data addresses. Symmetric writer for get_comment; sets a PLATE comment on a function or a data global alike."
+      "description": "Set a listing comment of a given kind (plate/pre/eol/post/repeatable) at ANY address, including data addresses. Symmetric writer for get_comment; sets a PLATE comment on a function or a data global alike. Bulk mode: entries=[{address, comment, type?}] writes many comments in one transaction."
     },
     {
       "path": "/set_function_no_return",

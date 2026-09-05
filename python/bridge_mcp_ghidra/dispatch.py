@@ -53,6 +53,11 @@ def get_timeout(endpoint: str, payload: dict | None = None) -> int:
         if count > 1:
             return min(base + count * 3, 600)
 
+    if name == "set_comment":
+        count = len(payload.get("entries", []))
+        if count > 1:
+            return min(base + count * 3, 600)
+
     if name == "disassemble_function":
         bulk = payload.get("functions")
         if bulk:
@@ -95,11 +100,44 @@ def _coerce_comment_entries(value):
     return value
 
 
+def _coerce_comment_entries_with_type(value):
+    """Like _coerce_comment_entries but preserves the optional per-entry ``type``
+    field carried by set_comment(entries=[{address, comment, type?}, ...]) bulk
+    mode. Entries missing ``comment`` are kept without the key so the server can
+    report them as per-entry failures instead of silently treating None as ""."""
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        try:
+            return _coerce_comment_entries_with_type(json.loads(stripped))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return value
+    items = value if isinstance(value, list) else [value] if isinstance(value, dict) and "address" in value else None
+    if items is None:
+        return value
+    result = []
+    for item in items:
+        if not isinstance(item, dict) or item.get("address") is None:
+            continue
+        entry = {"address": str(item["address"])}
+        if item.get("comment") is not None:
+            entry["comment"] = str(item["comment"])
+        if item.get("type") is not None:
+            entry["type"] = str(item["type"])
+        result.append(entry)
+    return result
+
+
 def _normalize_post_payload(endpoint: str, data: dict) -> dict:
-    if endpoint.strip("/").split("/")[-1] == "batch_set_comments":
+    name = endpoint.strip("/").split("/")[-1]
+    if name == "batch_set_comments":
         data = dict(data)
         for key in ("decompiler_comments", "disassembly_comments"):
             data[key] = _coerce_comment_entries(data.get(key, []))
+    elif name == "set_comment":
+        data = dict(data)
+        data["entries"] = _coerce_comment_entries_with_type(data.get("entries", []))
     return data
 
 
