@@ -10,6 +10,9 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 
 $Root = (Resolve-Path (Join-Path $PSScriptRoot ".")).Path
 $Encode = "UTF-8"
+# javac @argfile rejects a leading UTF-8 BOM (breaks the first source path);
+# Set-Content -Encoding UTF-8 writes a BOM on pwsh 7, so argfiles use no-BOM.
+$Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 
 function Write-Step([string]$msg) {
     Write-Host ""
@@ -139,13 +142,13 @@ function Invoke-Compile {
     New-Item -ItemType Directory -Force -Path $CfgDir  | Out-Null
 
     $cp = Get-GhidraClasspath
-    Set-Content -Path $CpFile -Value $cp -Encoding $Encode -NoNewline
+    [System.IO.File]::WriteAllText($CpFile, $cp, $Utf8NoBom)
     Write-Host "  classpath jars: $($cp.Split(';').Count)"
 
     $srcs = Get-ChildItem $MainSrc -Recurse -Filter *.java | ForEach-Object { $_.FullName }
     New-Item -ItemType Directory -Force -Path (Join-Path $BuildDir "src-list") | Out-Null
     $srcListFile = Join-Path $BuildDir "src-list\main-srcs.txt"
-    Set-Content -Path $srcListFile -Value ($srcs -join "`n") -Encoding $Encode
+    [System.IO.File]::WriteAllText($srcListFile, ($srcs -join "`n"), $Utf8NoBom)
 
     & $Javac --release 21 -encoding $Encode -proc:none -cp $cp -d $Classes @$srcListFile
     if ($LASTEXITCODE -ne 0) { Fail "javac failed (exit $LASTEXITCODE)" }
@@ -174,15 +177,16 @@ function Invoke-Test {
             (Join-Path $TestSrc "NoopThreadingStrategy.java")
         )
         $tList = Join-Path $BuildDir "src-list\test-srcs.txt"
-        Set-Content -Path $tList -Value ($tSrcs -join "`n") -Encoding $Encode
+        [System.IO.File]::WriteAllText($tList, ($tSrcs -join "`n"), $Utf8NoBom)
         & $Javac --release 21 -encoding $Encode -proc:none -cp $testCp -d $TestCls @$tList
         if ($LASTEXITCODE -ne 0) { Fail "test javac failed (exit $LASTEXITCODE)" }
 
         Push-Location $Root
-        & $Java -cp "$testCp;$TestCls" org.junit.runner.JUnitCore com.xebyte.offline.EndpointsJsonParityTest | Tee-Object -Variable parityOut
+        & $Java -cp "$testCp;$TestCls" org.junit.runner.JUnitCore com.xebyte.offline.EndpointsJsonParityTest 2>&1 | Tee-Object -Variable parityOut
+        $parityExit = $LASTEXITCODE
         Pop-Location
-        if ($lastExitJava -ne 0) { Fail "EndpointsJsonParityTest failed" }
-        if (-not $parityOut.Contains("OK")) { Fail "EndpointsJsonParityTest did not report OK" }
+        if ($parityExit -ne 0) { Fail "EndpointsJsonParityTest failed (exit $parityExit)" }
+        if (($parityOut -join "`n") -notmatch "\bOK\b") { Fail "EndpointsJsonParityTest did not report OK" }
     }
 
     if (Get-Command uv -ErrorAction SilentlyContinue) {
@@ -220,7 +224,7 @@ function Invoke-Package {
         if (-not (Test-Path $file)) { continue }
         $text = Get-Content $file -Raw -Encoding $Encode
         foreach ($k in $tokenMap.Keys) { $text = $text.Replace($k, $tokenMap[$k]) }
-        Set-Content -Path $file -Value $text -Encoding $Encode -NoNewline
+        [System.IO.File]::WriteAllText($file, $text, $Utf8NoBom)
     }
 
     # 2. Jar
@@ -239,7 +243,7 @@ function Invoke-Package {
     )
     New-Item -ItemType Directory -Force -Path $CfgDir | Out-Null
     $manFile = Join-Path $CfgDir "MANIFEST.MF"
-    Set-Content -Path $manFile -Value ($manifest -join "`r`n") -Encoding $Encode
+    [System.IO.File]::WriteAllText($manFile, ($manifest -join "`r`n"), $Utf8NoBom)
 
     Push-Location $BuildDir
     # jar cfm <out> <manifest> -C classes . -C resources . (skip static META-INF/MANIFEST.MF)
