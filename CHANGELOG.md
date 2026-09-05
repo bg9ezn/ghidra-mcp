@@ -63,6 +63,20 @@ truncates past the cap either — it now returns an explicit error so callers ca
 chunk deterministically. The Python bridge scales its request timeout by the
 bulk count for these endpoints and `decompile_function`.
 
+**New tool: `/apply_fid`.** Ghidra's Function ID signature library, exposed as
+a batch-first tool. The primary mode is a full-program scan — every function is
+hashed once and matched against the installed `.fidbf` libraries; an optional
+`addresses=` list narrows the scope (auto-split into ≤200-address chunks for
+bulk calls). Matches are renamed to the official FID form `<library>.<symbol>`
+(e.g. `libcmt._initterm`) with a sanitizer for name-invalid characters, and
+optionally annotated with a `Function ID Analyzer` analysis bookmark plus a
+`Library: <lib>` plate comment in the **same** transaction. `dry_run=true`
+reports would-be renames without writing; already-user-named functions are
+never clobbered when `always_apply_labels=false`; `max_samples` caps the report
+with an explicit `truncated` flag; per-address failures land in `errors[]` and
+never abort the batch. `multi_threshold` is passed through to the FID service
+for multi-candidate matches. `total_endpoints` 253 → 254.
+
 **True duplicates (−4).** `get_data_type_size` → `get_type_size` (a strict
 superset: adds alignment + path); `validate_data_type_exists` →
 `validate_data_type` with `address` now optional;

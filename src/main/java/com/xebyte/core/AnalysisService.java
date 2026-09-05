@@ -35,7 +35,15 @@ import ghidra.program.model.symbol.Symbol;
 import ghidra.util.Msg;
 import ghidra.util.task.ConsoleTaskMonitor;
 import ghidra.util.task.TaskMonitor;
-
+import ghidra.feature.fid.db.FidFile;
+import ghidra.feature.fid.db.FidFileManager;
+import ghidra.feature.fid.db.FidQueryService;
+import ghidra.feature.fid.db.LibraryRecord;
+import ghidra.feature.fid.service.FidMatch;
+import ghidra.feature.fid.service.FidMatchScore;
+import ghidra.feature.fid.service.FidSearchResult;
+import ghidra.feature.fid.service.FidService;
+import ghidra.program.model.symbol.SourceType;
 import javax.swing.SwingUtilities;
 import java.lang.reflect.InvocationTargetException;
 import java.nio.charset.StandardCharsets;
@@ -5178,6 +5186,350 @@ public class AnalysisService {
         }
 
         return Response.ok(out);
+    }
+
+    // ========================================================================
+    // /apply_fid -- Function ID signature library application
+    // ========================================================================
+    // Primary mode is a full-program batch scan (FidService.processProgram hashes
+    // every function ONCE). addresses= is an optional application-scope filter
+    // (empty = all functions); lists longer than 200 are split into <=200 chunks,
+    // each an independently-tolerated application unit (per-address errors[]).
+    // matches are renamed to <lib>.<symbol> (official FID form, e.g. libcmt._initterm
+    // from FunctionRecord.getName()); family name only used as a prefix fallback for
+    // non-MSwc libraries whose record name carries no 'lib.' prefix.
+    // Only one transaction: renames + bookmarks + plate comments commit together in
+    // a single executeWrite; dry_run only reads and reports.
+    private static final int FID_MAX_ADDR_PER_SEGMENT = 200;
+
+    @McpTool(path = "/apply_fid", method = "POST",
+             description = "Apply Function ID signature matching on the program. Default is a full-program "
+                     + "batch scan (every function hashed once). addresses= optionally limits the application "
+                     + "scope to a comma-separated list (lists above 200 are auto-split into <=200 chunks). "
+                     + "Matched functions are renamed to <lib>.<symbol> (official FID form, e.g. libcmt._initterm); "
+                     + "optional Function ID Analyzer bookmarks and 'Library:' plate comments are written in the "
+                     + "same transaction. dry_run=true only reports would-be renames. samples is capped at "
+                     + "max_samples with an explicit truncated flag. Per-address failures are reported in errors[], "
+                     + "never aborting the batch.",
+             category = "analysis")
+    public Response applyFid(
+            @Param(value = "program", defaultValue = "",
+                   description = "Target program name (omit for active program).") String programName,
+            @Param(value = "addresses", defaultValue = "",
+                   description = "Comma-separated addresses. Empty = all functions (full-program batch mode). "
+                           + "Lists above 200 are split into <=200 chunks and applied independently.") String addressesParam,
+            @Param(value = "score_threshold", defaultValue = "",
+                   description = "Single-match score threshold. Empty/<=0 falls back to FidService default.") Float scoreThreshold,
+            @Param(value = "multi_threshold", defaultValue = "",
+                   description = "Multi-name match threshold; pass-through (FID internal multi-candidate logic "
+                           + "uses its own default). Empty/<=0 uses FidService default.") Float multiThreshold,
+            @Param(value = "always_apply_labels", defaultValue = "true",
+                   description = "Always rename matched functions, even ones that already carry a non-FUN_ name. "
+                           + "When false, already-user-named functions are left untouched (their match is still counted).") boolean alwaysApply,
+            @Param(value = "create_bookmarks", defaultValue = "true",
+                   description = "Write a 'Function ID Analyzer' analysis bookmark at each matched entry point.") boolean createBookmarks,
+            @Param(value = "create_plate_comment", defaultValue = "true",
+                   description = "Write a 'Library: <lib>' plate comment at each matched entry point.") boolean createPlateComment,
+            @Param(value = "dry_run", defaultValue = "false",
+                   description = "Only report what would be renamed/bookmarked; never write to the program.") boolean dryRun,
+            @Param(value = "max_samples", defaultValue = "20",
+                   description = "Maximum number of samples to return (>=1). When more matches exist, "
+                           + "truncated=true is set; counts stay complete.") int maxSamples) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+        final long startMs = System.currentTimeMillis();
+
+        final FidService fidService = new FidService();
+        final ghidra.program.model.lang.Language language = program.getLanguage();
+        final String langId = language.getLanguageID().getIdAsString();
+
+        if (!fidService.canProcess(language)) {
+            return Response.ok(JsonHelper.mapOf(
+                    "success", true,
+                    "program", program.getName(),
+                    "language", langId,
+                    "queryable", false,
+                    "queryable_libraries", new ArrayList<>(),
+                    "scanned_functions", 0,
+                    "matched_functions", 0,
+                    "renamed_functions", 0,
+                    "duration_ms", (System.currentTimeMillis() - startMs),
+                    "duration_total_s", (System.currentTimeMillis() - startMs) / 1000.0,
+                    "per_library", new ArrayList<>(),
+                    "samples", new ArrayList<>(),
+                    "max_samples", maxSamples,
+                    "truncated", false,
+                    "errors", new ArrayList<>(),
+                    "dry_run", dryRun,
+                    "message", "No FID signature libraries can query language " + langId,
+                    "error", null));
+        }
+
+        final float effectiveScore = (scoreThreshold != null && scoreThreshold > 0f)
+                ? scoreThreshold : fidService.getDefaultScoreThreshold();
+        final float effectiveMulti = (multiThreshold != null && multiThreshold > 0f)
+                ? multiThreshold : fidService.getDefaultMultiNameThreshold();
+        final int effectSamples = Math.max(1, maxSamples);
+
+        // queryable libraries: installed .fidbf entries that can process this language
+        final List<String> queryableLibraries = new ArrayList<>();
+        for (FidFile f : FidFileManager.getInstance().getFidFiles()) {
+            if (f.canProcessLanguage(language)) queryableLibraries.add(f.getBaseName());
+        }
+
+        // Resolve addresses into <=200-chunks; empty input -> single full-program segment
+        final List<AddressSet> segments = new ArrayList<>();
+        final List<Map<String, Object>> parseErrors = new ArrayList<>();
+        if (addressesParam == null || addressesParam.trim().isEmpty()) {
+            segments.add(null);
+        } else {
+            List<Address> parsed = new ArrayList<>();
+            for (String part : addressesParam.split(",")) {
+                String t = part.trim();
+                if (t.isEmpty()) continue;
+                Address a = ServiceUtils.parseAddress(program, t);
+                if (a == null) {
+                    Map<String, Object> err = new LinkedHashMap<>();
+                    err.put("address", t);
+                    String reason = ServiceUtils.getLastParseError();
+                    err.put("reason", reason != null ? reason : "unparseable address");
+                    parseErrors.add(err);
+                } else {
+                    parsed.add(a);
+                }
+            }
+            if (parsed.isEmpty()) {
+                return Response.err("addresses= provided but none parsed successfully; checked " + parseErrors.size()
+                        + " address(es), first error: " + (parseErrors.isEmpty() ? "n/a"
+                                : parseErrors.get(0).get("reason")));
+            }
+            for (int i = 0; i < parsed.size(); i += FID_MAX_ADDR_PER_SEGMENT) {
+                AddressSet seg = new AddressSet();
+                for (int j = i; j < Math.min(i + FID_MAX_ADDR_PER_SEGMENT, parsed.size()); j++) {
+                    seg.add(parsed.get(j));
+                }
+                segments.add(seg);
+            }
+        }
+
+        // Match once over the whole program; results are consumed by the write/read stage.
+        final List<FidSearchResult>[] resultsHolder = new List[1];
+        resultsHolder[0] = null;
+        try {
+            threadingStrategy.executeRead(() -> {
+                FidQueryService q = FidFileManager.getInstance().openFidQueryService(language, false);
+                try {
+                    resultsHolder[0] = fidService.processProgram(program, q, effectiveScore, TaskMonitor.DUMMY);
+                } finally {
+                    q.close();
+                }
+                return null;
+            });
+        } catch (Exception e) {
+            return Response.err("FID matching failed: " + e.getMessage());
+        }
+        final List<FidSearchResult> allResults = resultsHolder[0] != null ? resultsHolder[0] : Collections.emptyList();
+
+        // Build stats/samples/errors; write ONLY inside executeWrite.
+        final Map<String, Object> outcome;
+        try {
+            if (dryRun) {
+                outcome = threadingStrategy.executeRead(() -> applyFidBuildOutcome(
+                        program, allResults, segments, effectiveScore, effectiveMulti,
+                        alwaysApply, createBookmarks, createPlateComment, false, effectSamples, parseErrors, startMs));
+            } else {
+                outcome = threadingStrategy.executeWrite(program, "Apply Function ID", () -> applyFidBuildOutcome(
+                        program, allResults, segments, effectiveScore, effectiveMulti,
+                        alwaysApply, createBookmarks, createPlateComment, true, effectSamples, parseErrors, startMs));
+            }
+        } catch (Exception e) {
+            return Response.err("FID apply failed: " + e.getMessage());
+        }
+
+        Map<String, Object> m = new LinkedHashMap<>(outcome);
+        m.put("success", true);
+        m.put("program", program.getName());
+        m.put("language", langId);
+        m.put("queryable", true);
+        m.put("queryable_libraries", queryableLibraries);
+        m.put("max_samples", effectSamples);
+        m.put("dry_run", dryRun);
+        m.put("error", null);
+        return Response.ok(m);
+    }
+
+    private Map<String, Object> applyFidBuildOutcome(
+            Program program, List<FidSearchResult> results, List<AddressSet> segments,
+            float scoreThreshold, float multiThreshold, boolean alwaysApply,
+            boolean createBookmarks, boolean createPlateComment, boolean write,
+            int maxSamples, List<Map<String, Object>> parseErrors, long startMs) {
+        final ghidra.program.model.listing.FunctionManager fm = program.getFunctionManager();
+        final ghidra.program.model.listing.Listing listing = program.getListing();
+
+        int scanned = 0;
+        int matched = 0;
+        int renamed = 0;
+        boolean truncated = false;
+        List<Map<String, Object>> samples = new ArrayList<>();
+        List<Map<String, Object>> errors = new ArrayList<>(parseErrors);
+        Map<String, int[]> perLibrary = new LinkedHashMap<>();
+
+        // segments contains either one null entry (full program) or concrete AddressSets.
+        boolean fullProgram = segments.size() == 1 && segments.get(0) == null;
+
+        // scanned_functions: total functions inside the application scope.
+        if (fullProgram) {
+            for (ghidra.program.model.listing.Function f : fm.getFunctions(true)) scanned++;
+        } else {
+            List<AddressSet> concrete = new ArrayList<>();
+            for (AddressSet seg : segments) if (seg != null) concrete.add(seg);
+            for (ghidra.program.model.listing.Function f : fm.getFunctions(true)) {
+                Address ep = f.getEntryPoint();
+                for (AddressSet seg : concrete) {
+                    if (seg.contains(ep)) { scanned++; break; }
+                }
+            }
+        }
+
+        for (FidSearchResult r : results) {
+            ghidra.program.model.listing.Function func = r.function;
+            if (func == null) continue;
+            Address entry = func.getEntryPoint();
+            if (!fullProgram) {
+                boolean inScope = false;
+                for (AddressSet seg : segments) {
+                    if (seg != null && seg.contains(entry)) { inScope = true; break; }
+                }
+                if (!inScope) continue;
+            }
+            if (r.matches == null || r.matches.isEmpty()) continue;
+
+            // best match by overall score
+            FidMatch best = null;
+            float bestScore = Float.NEGATIVE_INFINITY;
+            FidMatch second = null;
+            float secondScore = Float.NEGATIVE_INFINITY;
+            for (FidMatch mt : r.matches) {
+                float s = mt.getOverallScore();
+                if (best == null || s > bestScore) {
+                    second = best;
+                    secondScore = bestScore;
+                    best = mt;
+                    bestScore = s;
+                } else if (second == null || s > secondScore) {
+                    second = mt;
+                    secondScore = s;
+                }
+            }
+            if (best == null) continue;
+            matched++;
+
+            // conflict: a competing candidate within the multi-name threshold
+            boolean conflict = false;
+            if (secondScore != Float.NEGATIVE_INFINITY && (bestScore - secondScore) < multiThreshold) {
+                conflict = true;
+            }
+
+            String oldName = func.getName();
+            boolean alreadyUserNamed = !ServiceUtils.isAutoGeneratedName(oldName)
+                    && !oldName.startsWith("lib.");
+            boolean apply = alwaysApply || ServiceUtils.isAutoGeneratedName(oldName) || oldName.startsWith("lib.");
+
+            // library / symbol
+            final ghidra.feature.fid.db.LibraryRecord lib = best.getLibraryRecord();
+            String libName = lib != null ? lib.getLibraryFamilyName() : "lib";
+            String fnName = best.getFunctionRecord().getName();
+            String newName;
+            try {
+                newName = (fnName != null && fnName.contains("."))
+                        ? sanitizeSymbol(fnName)
+                        : sanitizeSymbol((libName == null ? "lib" : libName) + "." + (fnName == null ? "unknown" : fnName));
+            } catch (Exception e) {
+                Map<String, Object> err = new LinkedHashMap<>();
+                err.put("address", entry.toString(false));
+                err.put("reason", "name build failed: " + e.getMessage());
+                errors.add(err);
+                continue;
+            }
+
+            try {
+                if (write && apply && !newName.equals(oldName)) {
+                    func.setName(newName, SourceType.ANALYSIS);
+                    renamed++;
+                } else if (!apply) {
+                    // matched but intentionally not renamed (user-named and always_apply_labels=false)
+                } else if (newName.equals(oldName)) {
+                    // idempotent: already named with the same target
+                }
+                if (write && createBookmarks) {
+                    program.getBookmarkManager().setBookmark(entry,
+                            ghidra.program.model.listing.BookmarkType.ANALYSIS,
+                            "Function ID Analyzer", libName);
+                }
+                if (write && createPlateComment) {
+                    listing.setComment(entry, CodeUnit.PLATE_COMMENT, "Library: " + libName);
+                }
+            } catch (Exception e) {
+                Map<String, Object> err = new LinkedHashMap<>();
+                err.put("address", entry.toString(false));
+                err.put("reason", e.getMessage());
+                errors.add(err);
+                continue;
+            }
+
+            int[] libStat = perLibrary.computeIfAbsent(libName == null ? "lib" : libName, k -> new int[2]);
+            libStat[0]++;
+            if (write && apply && !newName.equals(oldName)) {
+                libStat[1]++;
+            }
+
+            if (samples.size() < maxSamples) {
+                Map<String, Object> s = new LinkedHashMap<>();
+                s.put("address", entry.toString(false));
+                s.put("old_name", oldName);
+                s.put("new_name", newName);
+                if (conflict) s.put("conflict", true);
+                samples.add(s);
+            } else {
+                truncated = true;
+            }
+        }
+
+        List<Map<String, Object>> perLibOut = new ArrayList<>();
+        for (Map.Entry<String, int[]> e : perLibrary.entrySet()) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("library", e.getKey());
+            row.put("hits", e.getValue()[0]);
+            row.put("renamed", e.getValue()[1]);
+            perLibOut.add(row);
+        }
+
+        long elapsed = System.currentTimeMillis() - startMs;
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("scanned_functions", scanned);
+        m.put("matched_functions", matched);
+        m.put("renamed_functions", renamed);
+        m.put("duration_ms", elapsed);
+        m.put("duration_total_s", elapsed / 1000.0);
+        m.put("per_library", perLibOut);
+        m.put("samples", samples);
+        m.put("truncated", truncated);
+        m.put("errors", errors);
+        return m;
+    }
+
+    private static String sanitizeSymbol(String s) {
+        StringBuilder sb = new StringBuilder();
+        for (char c : s.toCharArray()) {
+            if (Character.isWhitespace(c) || c == '<' || c == '>' || c == ':' ||
+                    c == '?' || c == '*' || c == '"' || c == '(' || c == ')' || c == ',') {
+                sb.append('_');
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
     }
 }
 

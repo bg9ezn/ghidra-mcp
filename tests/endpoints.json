@@ -1,7 +1,7 @@
 {
   "version": "7.0.0",
   "description": "GhidraMCP REST API Endpoint Specification",
-  "total_endpoints": 253,
+  "total_endpoints": 254,
   "categories": {
     "listing": "List program data",
     "getter": "Get specific data",
@@ -2745,6 +2745,23 @@
         "program"
       ],
       "description": "Validate function prototype"
+    },
+    {
+      "path": "/apply_fid",
+      "method": "POST",
+      "category": "analysis",
+      "params": [
+        "program",
+        "addresses",
+        "score_threshold",
+        "multi_threshold",
+        "always_apply_labels",
+        "create_bookmarks",
+        "create_plate_comment",
+        "dry_run",
+        "max_samples"
+      ],
+      "description": "Apply Ghidra Function ID library matching to a program. Primary mode scans all functions in batch; optional addresses filters the scan (auto-chunked to at most 200 per chunk for bulk requests). Renames matched functions to <library>.<symbol>, optionally creating an ANALYSIS bookmark and a plate comment. Matches are non-destructive for user-named functions when always_apply_labels is false. Multi-candidate threshold (multi_threshold) is passed through to the FID service when provided."
     }
   ]
 }
