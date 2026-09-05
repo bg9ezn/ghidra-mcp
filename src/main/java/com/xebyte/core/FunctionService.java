@@ -340,9 +340,13 @@ public class FunctionService {
             String[] functionRefs = functionsParam.split(",");
             Map<String, Object> resultMap = new LinkedHashMap<>();
             final int MAX_FUNCTIONS = 20; // Limit to prevent overload
+            if (functionRefs.length > MAX_FUNCTIONS) {
+                return Response.err("functions exceeds max of " + MAX_FUNCTIONS
+                        + " per request (" + functionRefs.length + " given); chunk client-side");
+            }
 
-            for (int i = 0; i < functionRefs.length && i < MAX_FUNCTIONS; i++) {
-                String funcRef = functionRefs[i].trim();
+            for (String funcRefRaw : functionRefs) {
+                String funcRef = funcRefRaw.trim();
                 if (funcRef.isEmpty()) continue;
 
                 Function function = ServiceUtils.resolveFunction(program, funcRef);
@@ -495,19 +499,22 @@ public class FunctionService {
      * Get assembly code for a function.
      * If programName is provided, uses that program instead of the current one.
      */
-    @McpTool(path = "/disassemble_function", description = "Get assembly listing of function. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution.", category = "function")
+    @McpTool(path = "/disassemble_function", description = "Get assembly listing of ONE function (address) OR MANY (functions=comma-separated names/addresses, max 200 per call; over-limit is an error, never silent truncation). Each result carries the same instruction entries as single mode. On programs with multiple address spaces, prefix addresses with the space name (mem:1000).", category = "function")
     public Response disassembleFunction(
-            @Param(value = "address", paramType = "address",
-                   description = "Address in the program. Accepts 0x<hex> (default space) or <space>:<hex> "
-                               + "(e.g., mem:1000, code:ff00). Note: some programs — particularly "
-                               + "embedded/microcontroller targets — are not address-space-agnostic; "
-                               + "use get_address_spaces to discover spaces before assuming a plain hex "
-                               + "address is unambiguous.") String addressStr,
+            @Param(value = "address", paramType = "address", defaultValue = "",
+                   description = "Function address or name (single mode). Omit when using functions=") String addressStr,
+            @Param(value = "functions", defaultValue = "",
+                   description = "Bulk mode: comma-separated function references (names or addresses), max 200. When set, address is ignored.") String functionsParam,
             @Param(value = "program", defaultValue = "") String programName) {
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
         Program program = pe.program();
-        if (addressStr == null || addressStr.isEmpty()) return Response.err("Address is required");
+
+        if (functionsParam != null && !functionsParam.trim().isEmpty()) {
+            return bulkDisassembleFunctions(functionsParam, programName);
+        }
+
+        if (addressStr == null || addressStr.isEmpty()) return Response.err("address or functions is required");
 
         try {
             Address addr = ServiceUtils.parseAddress(program, addressStr);
@@ -515,38 +522,87 @@ public class FunctionService {
             Function func = ServiceUtils.getFunctionForAddress(program, addr);
             if (func == null) return Response.err("No function found at or containing address " + addressStr);
 
-            StringBuilder sb = new StringBuilder();
             Listing listing = program.getListing();
-            Address start = func.getEntryPoint();
-            Address end = func.getBody().getMaxAddress();
-
-            List<Map<String, Object>> instructions_out = new ArrayList<>();
-            InstructionIterator instructions = listing.getInstructions(start, true);
-            while (instructions.hasNext()) {
-                Instruction instr = instructions.next();
-                if (instr.getAddress().compareTo(end) > 0) {
-                    break; // Stop if we've gone past the end of the function
-                }
-                String comment = listing.getComment(CodeUnit.EOL_COMMENT, instr.getAddress());
-
-                Map<String, Object> entry = new LinkedHashMap<>();
-                entry.put("address", instr.getAddress().toString(false));
-                entry.put("instruction", instr.toString());
-                if (comment != null && !comment.isEmpty()) {
-                    entry.put("comment", comment);
-                }
-                instructions_out.add(entry);
-            }
-
-            return ServiceUtils.listed("instructions", instructions_out);
+            return ServiceUtils.listed("instructions", collectInstructions(listing, func));
         } catch (Exception e) {
             return Response.err("Error disassembling function: " + e.getMessage());
         }
     }
 
-    // Backward compatible overload for internal callers
+    // Shared instruction collector – identical fields to single mode (address / instruction / comment?).
+    private List<Map<String, Object>> collectInstructions(Listing listing, Function func) {
+        List<Map<String, Object>> instructions_out = new ArrayList<>();
+        Address start = func.getEntryPoint();
+        Address end = func.getBody().getMaxAddress();
+
+        InstructionIterator instructions = listing.getInstructions(start, true);
+        while (instructions.hasNext()) {
+            Instruction instr = instructions.next();
+            if (instr.getAddress().compareTo(end) > 0) {
+                break; // Stop if we've gone past the end of the function
+            }
+            String comment = listing.getComment(CodeUnit.EOL_COMMENT, instr.getAddress());
+
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("address", instr.getAddress().toString(false));
+            entry.put("instruction", instr.toString());
+            if (comment != null && !comment.isEmpty()) {
+                entry.put("comment", comment);
+            }
+            instructions_out.add(entry);
+        }
+        return instructions_out;
+    }
+
+    // Bulk helper for disassemble_function(functions=...). Merged into
+    // disassemble_function in 7.0.0; not a standalone @McpTool.
+    public Response bulkDisassembleFunctions(String functionsParam, String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        String[] refs = functionsParam.split(",");
+        List<String> functionRefs = new ArrayList<>();
+        for (String r : refs) {
+            if (!r.trim().isEmpty()) functionRefs.add(r.trim());
+        }
+        if (functionRefs.isEmpty()) return Response.err("functions is required for bulk mode");
+        final int MAX_FUNCTIONS = 200;
+        if (functionRefs.size() > MAX_FUNCTIONS) {
+            return Response.err("functions exceeds max of " + MAX_FUNCTIONS
+                    + " per request (" + functionRefs.size() + " given); chunk client-side");
+        }
+
+        Listing listing = program.getListing();
+        List<Map<String, Object>> results = new ArrayList<>();
+        for (String funcRef : functionRefs) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("address", funcRef);
+            try {
+                Function func = ServiceUtils.resolveFunction(program, funcRef);
+                if (func == null) {
+                    row.put("error", "No function found for " + funcRef);
+                    results.add(row);
+                    continue;
+                }
+                row.put("address", func.getEntryPoint().toString(false));
+                row.put("name", func.getName());
+                row.put("instructions", collectInstructions(listing, func));
+            } catch (Exception e) {
+                row.put("error", e.getMessage());
+            }
+            results.add(row);
+        }
+        return Response.ok(JsonHelper.mapOf("results", results, "returned", results.size(), "program", program.getName()));
+    }
+
+    // Backward compatible overloads for internal callers
     public Response disassembleFunction(String addressStr) {
         return disassembleFunction(addressStr, null);
+    }
+
+    public Response disassembleFunction(String addressStr, String programName) {
+        return disassembleFunction(addressStr, null, programName);
     }
 
     // ========================================================================

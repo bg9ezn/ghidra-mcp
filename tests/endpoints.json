@@ -963,6 +963,7 @@
       "category": "decompile",
       "params": [
         "address",
+        "functions",
         "program"
       ],
       "description": "Disassemble function"
@@ -1512,6 +1513,7 @@
       "category": "xref",
       "params": [
         "address",
+        "addresses",
         "offset",
         "limit",
         "program"

@@ -81,21 +81,27 @@ public class XrefCallGraphService {
     /**
      * Get all references from a specific address (xref from)
      */
-    @McpTool(path = "/get_xrefs_from", description = "Get cross-references from an address. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution.", category = "xref")
+    @McpTool(path = "/get_xrefs_from", description = "Get cross-references FROM ONE address OR MANY (addresses=comma-separated, max 200 per call; over-limit is an error, never silent truncation). Bulk mode returns every reference per address (offset/limit ignored). On programs with multiple address spaces, prefix addresses with the space name (mem:1000).", category = "xref")
     public Response getXrefsFrom(
             @Param(value = "address", paramType = "address",
-                   description = "Address in the program. Accepts 0x<hex> (default space) or <space>:<hex> "
-                               + "(e.g., mem:1000, code:ff00). Note: some programs — particularly "
+                   description = "Address (single mode). Accepts 0x<hex> or <space>:<hex> (e.g., mem:1000, code:ff00). Note: some programs — particularly "
                                + "embedded/microcontroller targets — are not address-space-agnostic; "
                                + "use get_address_spaces to discover spaces before assuming a plain hex "
-                               + "address is unambiguous.") String addressStr,
+                               + "address is unambiguous. Omit when using addresses=") String addressStr,
+            @Param(value = "addresses", defaultValue = "",
+                   description = "Bulk mode: comma-separated addresses, max 200. When set, address/offset/limit are ignored.") String addressesParam,
             @Param(value = "offset", defaultValue = "0") int offset,
             @Param(value = "limit", defaultValue = "100") int limit,
             @Param(value = "program", defaultValue = "") String programName) {
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
         Program program = pe.program();
-        if (addressStr == null || addressStr.isEmpty()) return Response.err("Address is required");
+
+        if (addressesParam != null && !addressesParam.trim().isEmpty()) {
+            return bulkGetXrefsFrom(addressesParam, programName);
+        }
+
+        if (addressStr == null || addressStr.isEmpty()) return Response.err("address or addresses is required");
 
         try {
             Address addr = ServiceUtils.parseAddress(program, addressStr);
@@ -132,6 +138,65 @@ public class XrefCallGraphService {
         } catch (Exception e) {
             return Response.err("Error getting references from address: " + e.getMessage());
         }
+    }
+
+    // Bulk helper for get_xrefs_from(addresses=...). Merged into
+    // get_xrefs_from in 7.0.0; not a standalone @McpTool. offset/limit are ignored
+    // in bulk mode — every reference per address is returned.
+    public Response bulkGetXrefsFrom(String addressesParam, String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        String[] parts = addressesParam.split(",");
+        List<String> addrs = new ArrayList<>();
+        for (String p : parts) {
+            if (!p.trim().isEmpty()) addrs.add(p.trim());
+        }
+        if (addrs.isEmpty()) return Response.err("addresses is required for bulk mode");
+        final int MAX_ADDRESSES = 200;
+        if (addrs.size() > MAX_ADDRESSES) {
+            return Response.err("addresses exceeds max of " + MAX_ADDRESSES
+                    + " per request (" + addrs.size() + " given); chunk client-side");
+        }
+
+        ReferenceManager refManager = program.getReferenceManager();
+        List<Map<String, Object>> results = new ArrayList<>();
+        for (String addrStr : addrs) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("address", addrStr);
+            try {
+                Address addr = ServiceUtils.parseAddress(program, addrStr);
+                if (addr == null) {
+                    row.put("error", ServiceUtils.getLastParseError());
+                    results.add(row);
+                    continue;
+                }
+                List<String> refs = new ArrayList<>();
+                for (Reference ref : refManager.getReferencesFrom(addr)) {
+                    Address toAddr = ref.getToAddress();
+                    RefType refType = ref.getReferenceType();
+
+                    String targetInfo = "";
+                    Function toFunc = program.getFunctionManager().getFunctionAt(toAddr);
+                    if (toFunc != null) {
+                        targetInfo = " to function " + toFunc.getName();
+                    } else {
+                        Data data = program.getListing().getDataAt(toAddr);
+                        if (data != null) {
+                            targetInfo = " to data " + (data.getLabel() != null ? data.getLabel() : data.getPathName());
+                        }
+                    }
+                    refs.add(String.format("To %s%s [%s]", toAddr, targetInfo, refType.getName()));
+                }
+                row.put("references", refs);
+                row.put("count", refs.size());
+            } catch (Exception e) {
+                row.put("error", e.getMessage());
+            }
+            results.add(row);
+        }
+        return Response.ok(JsonHelper.mapOf("results", results, "returned", results.size(), "program", program.getName()));
     }
 
     /**

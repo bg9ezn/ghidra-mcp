@@ -47,7 +47,7 @@ public class XrefCallGraphServiceValidationTest extends TestCase {
     }
 
     public void testGetXrefsFromDegradesGracefully() {
-        assertNoProgram(xref.getXrefsFrom("0x401000", 0, 100, ""));
+        assertNoProgram(xref.getXrefsFrom("0x401000", "", 0, 100, ""));
     }
 
     public void testGetFunctionJumpTargetsDegradesGracefully() {

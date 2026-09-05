@@ -1344,6 +1344,28 @@ class TestGetTimeout(unittest.TestCase):
         payload = {"map": "flags", "address": "0x1000", "value": "1"}
         self.assertEqual(get_timeout("/set_property", payload), 30)
 
+    def test_disassemble_function_bulk_scaling(self):
+        from bridge_mcp_ghidra import get_timeout
+
+        payload = {"functions": ",".join(f"0x100{i}" for i in range(10))}
+        self.assertEqual(get_timeout("/disassemble_function", payload), 30 + 10 * 18)
+
+    def test_disassemble_function_single_no_scaling(self):
+        from bridge_mcp_ghidra import get_timeout
+
+        self.assertEqual(get_timeout("/disassemble_function", {"address": "0x1000"}), 30)
+
+    def test_get_xrefs_from_bulk_scaling(self):
+        from bridge_mcp_ghidra import get_timeout
+
+        payload = {"addresses": ",".join(f"0x100{i}" for i in range(10))}
+        self.assertEqual(get_timeout("/get_xrefs_from", payload), 30 + 10 * 8)
+
+    def test_get_xrefs_from_single_no_scaling(self):
+        from bridge_mcp_ghidra import get_timeout
+
+        self.assertEqual(get_timeout("/get_xrefs_from", {"address": "0x1000"}), 30)
+
 
 class TestBuildToolFunction(unittest.TestCase):
     """Test dynamic tool function builder."""

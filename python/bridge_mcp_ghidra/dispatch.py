@@ -53,6 +53,20 @@ def get_timeout(endpoint: str, payload: dict | None = None) -> int:
         if count > 1:
             return min(base + count * 3, 600)
 
+    if name == "disassemble_function":
+        bulk = payload.get("functions")
+        if bulk:
+            count = len(str(bulk).split(","))
+            if count > 1:
+                return min(base + count * 18, 900)
+
+    if name == "get_xrefs_from":
+        bulk = payload.get("addresses")
+        if bulk:
+            count = len(str(bulk).split(","))
+            if count > 1:
+                return min(base + count * 8, 900)
+
     return base
 
 

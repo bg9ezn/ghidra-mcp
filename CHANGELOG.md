@@ -50,6 +50,19 @@ bulk `entries=[{address,value}]` array in addition to the single
 separate `batch_` predecessor; this simply brings the property-map writer onto
 the same one-or-many pattern as the rest of the survivors.
 
+**Single/batch (new capability on two more survivors).** `disassemble_function`
+now accepts a bulk `functions="name0,name1,..."` comma-separated parameter in
+addition to the single `address` form; `get_xrefs_from` accepts a bulk
+`addresses="0x..,0x.."` parameter in addition to the single `address` form
+(bulk mode ignores `offset`/`limit` and returns every reference per address).
+These mount the 44k single-item round trips of a full-binary disassembly/xrefs
+survey onto ~510 bulk requests (collection time 61s → <15s). Both cap at
+**200 refs per request**; exceeding the cap is an explicit error, never a silent
+truncation. `decompile_function`'s bulk path (cap 20) no longer silently
+truncates past the cap either — it now returns an explicit error so callers can
+chunk deterministically. The Python bridge scales its request timeout by the
+bulk count for these endpoints and `decompile_function`.
+
 **True duplicates (−4).** `get_data_type_size` → `get_type_size` (a strict
 superset: adds alignment + path); `validate_data_type_exists` →
 `validate_data_type` with `address` now optional;

@@ -258,7 +258,7 @@ public class HeadlessEndpointHandler {
     }
 
     public String getXrefsFrom(String addressStr, int offset, int limit, String programName) {
-        return xrefCallGraphService.getXrefsFrom(addressStr, offset, limit, programName).toJson();
+        return xrefCallGraphService.getXrefsFrom(addressStr, "", offset, limit, programName).toJson();
     }
 
     public String getFunctionXrefs(String functionName, int offset, int limit, String programName) {

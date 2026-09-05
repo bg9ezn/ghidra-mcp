@@ -1463,7 +1463,7 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
      * Get all references from a specific address (xref from)
      */
     private String getXrefsFrom(String addressStr, int offset, int limit, String programName) {
-        return xrefCallGraphService.getXrefsFrom(addressStr, offset, limit, programName).toJson();
+        return xrefCallGraphService.getXrefsFrom(addressStr, "", offset, limit, programName).toJson();
     }
 
     /**
