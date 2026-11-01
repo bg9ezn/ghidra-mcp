@@ -57,11 +57,11 @@ import java.util.stream.Collectors;
  *
  * <p>The GhidraMCPPlugin runs in the FrontEnd tool, which does NOT have
  * debugger services. This service finds a running CodeBrowser/Debugger tool
- * via {@link ToolManager#getRunningTools()} — the same pattern used by
+ * via {@link ToolManager#getRunningTools()} 鈥?the same pattern used by
  * {@link FrontEndProgramProvider} for ProgramManager access.</p>
  *
  * <p>The user must have a CodeBrowser open with the Debugger view active
- * (Window → Debugger). The AI then uses these endpoints to control the
+ * (Window 鈫?Debugger). The AI then uses these endpoints to control the
  * debug session while the user sees everything in Ghidra's synchronized UI.</p>
  */
 @McpToolGroup(value = "debugger",
@@ -373,6 +373,46 @@ public class DebuggerService {
     }
 
     /**
+     * Pick the best action from a collected map: prefer ones that don't
+     * require a UI prompt. Fault report 36: the attach session's first RESUME
+     * entry was a prompt-requiring "Go" variant, which made every resume fail
+     * even though a prompt-free equivalent existed.
+     */
+    private Target.ActionEntry pickTargetAction(Map<String, Target.ActionEntry> actions) {
+        Target.ActionEntry first = null;
+        for (Target.ActionEntry a : actions.values()) {
+            if (first == null) first = a;
+            if (!a.requiresPrompt()) return a;
+        }
+        return first;
+    }
+
+    /**
+     * Best-effort: invoke the target's REFRESH actions (passive data re-push,
+     * e.g. the module list) without UI prompts. Returns true if any refresh
+     * action was actually invoked.
+     */
+    private boolean invokeRefreshActions(TraceContext ctx) {
+        Target target = getTarget(ctx);
+        if (target == null) return false;
+        boolean any = false;
+        try {
+            for (Target.ActionEntry a : collectTargetActions(target, ActionName.REFRESH).values()) {
+                if (a.requiresPrompt()) continue;
+                try {
+                    a.invokeAsync(false).get(ACTION_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                    any = true;
+                } catch (Exception e) {
+                    // try the next refresh action
+                }
+            }
+        } catch (Exception e) {
+            Msg.warn(this, "REFRESH action collection failed: " + e.getMessage());
+        }
+        return any;
+    }
+
+    /**
      * Poll the current thread's execution state until it settles out of
      * RUNNING (or the timeout elapses). Call before a step action that
      * immediately follows another step/resume, to close the async window
@@ -419,13 +459,39 @@ public class DebuggerService {
         return false;
     }
 
+    /**
+     * Fault report 36 R7.1: accept args as a string or an array of strings.
+     * A list is joined with single spaces; elements containing whitespace are
+     * double-quoted so the backend launcher receives a usable command line.
+     */
+    private static String normalizeLaunchArgs(Object args) {
+        if (args == null) return "";
+        if (args instanceof String s) return s;
+        if (args instanceof List<?> list) {
+            StringBuilder sb = new StringBuilder();
+            for (Object item : list) {
+                if (item == null) continue;
+                String part = item.toString();
+                if (part.isBlank()) continue;
+                if (sb.length() > 0) sb.append(' ');
+                if (part.indexOf(' ') >= 0 || part.indexOf('\t') >= 0) {
+                    sb.append('"').append(part).append('"');
+                } else {
+                    sb.append(part);
+                }
+            }
+            return sb.toString();
+        }
+        return args.toString();
+    }
+
     @McpTool(path = "/debugger/launch", method = "POST",
             description = "Launch an executable through Ghidra's Trace RMI debugger launcher")
     public Response launch(
             @Param(value = "executable_path", source = ParamSource.BODY,
                     description = "Absolute path to the executable to launch") String executablePath,
             @Param(value = "args", source = ParamSource.BODY, defaultValue = "",
-                    description = "Command-line arguments to pass to the executable") String args,
+                    description = "Command-line arguments: a single string or an array of strings") Object argsRaw,
             @Param(value = "cwd", source = ParamSource.BODY, defaultValue = "",
                     description = "Working directory hint for launchers that expose one") String cwd,
             @Param(value = "timeout_seconds", source = ParamSource.BODY, defaultValue = "60",
@@ -436,6 +502,7 @@ public class DebuggerService {
                     description = "Optional launcher title or config name, e.g. dbgeng") String preferredOffer,
             @Param(value = "python_executable", source = ParamSource.BODY, defaultValue = "",
                     description = "Optional Python executable for Python-backed debugger launchers") String pythonExecutable) {
+        String args = normalizeLaunchArgs(argsRaw);
         PluginTool tool;
         try {
             // Cold-start of the Debugger tool template takes longer than 20s
@@ -649,6 +716,260 @@ public class DebuggerService {
         }
     }
 
+    /**
+     * Poll the trace's module table until it grows (or the budget elapses).
+     *
+     * <p>Used after interrupt(): the dbgeng Trace RMI adapter records newly
+     * loaded modules asynchronously once the target breaks, so the module
+     * table can still show the launch-time snapshot for a short window after
+     * execution stops. Passive: never issues target commands, just waits for
+     * the recorder to catch up.</p>
+     */
+    private int waitForModuleGrowth(Trace trace, int knownCount, long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        int last = knownCount;
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                last = trace.getModuleManager().getAllModules().size();
+            } catch (Exception e) {
+                // keep last known
+            }
+            if (last > knownCount) {
+                return last;
+            }
+            try {
+                Thread.sleep(MAPPING_SETTLE_POLL_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return last;
+            }
+        }
+        return last;
+    }
+
+    @McpTool(path = "/debugger/attach", method = "POST",
+            description = "Attach to a running process through Ghidra's Trace RMI " +
+                    "debugger launcher (creates a bound trace session)")
+    public Response attach(
+            @Param(value = "target", source = ParamSource.BODY,
+                    description = "Process id (PID) of the running target to attach to") String target,
+            @Param(value = "program", source = ParamSource.BODY, defaultValue = "",
+                    description = "Program path/name used to select launch offers and static mapping") String programName,
+            @Param(value = "timeout_seconds", source = ParamSource.BODY, defaultValue = "60",
+                    description = "Maximum seconds to wait for the debugger trace") int timeoutSeconds,
+            @Param(value = "offer", source = ParamSource.BODY, defaultValue = "",
+                    description = "Optional attach launcher title or config name, e.g. dbgeng attach") String preferredOffer,
+            @Param(value = "attach_flags", source = ParamSource.BODY, defaultValue = "0",
+                    description = "Attach flags passed to the backend (dbgeng OPT_ATTACH_FLAGS)") int attachFlags,
+            @Param(value = "python_executable", source = ParamSource.BODY, defaultValue = "",
+                    description = "Optional Python executable for Python-backed debugger launchers") String pythonExecutable) {
+        if (target == null || target.isBlank()) {
+            return Response.err("attach requires 'target' (a numeric process id). " +
+                    "Example: {\"target\": \"14124\"}");
+        }
+        long pid;
+        try {
+            pid = Long.parseLong(target.trim());
+        } catch (NumberFormatException e) {
+            return Response.err("attach 'target' must be a numeric process id, got: " + target +
+                    ". Process-name attach is not supported by Trace RMI launchers.");
+        }
+
+        PluginTool tool;
+        try {
+            tool = getOrStartDebuggerTool(60);
+        } catch (TimeoutException e) {
+            return Response.err("Timed out while auto-starting Ghidra's Debugger tool. " +
+                    "Open the Debugger tool manually, then retry debugger_attach.");
+        }
+        if (tool == null) return noDebugger();
+
+        TraceRmiLauncherService launcherSvc =
+                tool.getService(TraceRmiLauncherService.class);
+        if (launcherSvc == null) {
+            return Response.err("Trace RMI launcher service not available. Open CodeBrowser, " +
+                    "enable Window > Debugger, and make sure the debugger launcher plugins are loaded.");
+        }
+
+        try {
+            // Attach offers are enumerated per program (their launch scripts
+            // are language-aware), so a program must be resolvable. Without an
+            // explicit 'program' the provider falls back to the single open
+            // program or the active one.
+            ghidra.program.model.listing.Program program =
+                    programProvider.resolveProgram(programName);
+            Collection<TraceRmiLaunchOffer> offers = launcherSvc.getOffers(program);
+            if (offers.isEmpty()) {
+                return Response.err("No debugger launch/attach offers are available for " +
+                        (program != null ? program.getName() : "the current program") +
+                        ". Install/enable a backend such as Ghidra's dbgeng agent.");
+            }
+
+            // Prefer explicit attach offers; among them prefer dbgeng.
+            TraceRmiLaunchOffer offer = selectLaunchOffer(offers, preferredOffer);
+            List<TraceRmiLaunchOffer> attachOffers = offers.stream()
+                    .filter(o -> !o.requiresImage())
+                    .toList();
+            if (preferredOffer == null || preferredOffer.isBlank()) {
+                List<TraceRmiLaunchOffer> dbgengAttach = attachOffers.stream()
+                        .filter(o -> {
+                            String n = (o.getTitle() + " " + o.getConfigName()).toLowerCase(Locale.ROOT);
+                            return n.contains("dbgeng") && n.contains("attach");
+                        }).toList();
+                if (!dbgengAttach.isEmpty()) {
+                    offer = dbgengAttach.get(0);
+                } else if (!attachOffers.isEmpty()) {
+                    offer = attachOffers.get(0);
+                }
+            }
+            if (offer == null) {
+                return Response.err("No attach offer could be selected. Available offers: " +
+                        offers.stream().map(TraceRmiLaunchOffer::getTitle).collect(Collectors.joining(", ")));
+            }
+            if (offer.requiresImage()) {
+                return Response.err("Selected launcher '" + offer.getTitle() +
+                        "' requires an image and cannot be used for attach. Attach-capable offers: " +
+                        (attachOffers.isEmpty() ? "(none)" : attachOffers.stream()
+                                .map(TraceRmiLaunchOffer::getTitle).collect(Collectors.joining(", "))));
+            }
+
+            // Locate the PID parameter (dbgeng attach exposes env:OPT_TARGET_PID).
+            Map<String, LaunchParameter<?>> parameters = offer.getParameters();
+            String pidParamName = null;
+            for (String name : parameters.keySet()) {
+                if (name.toLowerCase(Locale.ROOT).contains("pid")) {
+                    pidParamName = name;
+                    break;
+                }
+            }
+            if (pidParamName == null) {
+                return Response.err("Attach offer '" + offer.getTitle() +
+                        "' does not expose a PID parameter. Available parameters: " +
+                        parameters.keySet());
+            }
+            final String pidParamNameF = pidParamName;
+            final LaunchParameter<?> pidParamF = parameters.get(pidParamName);
+            final long pidF = pid;
+            final int attachFlagsF = attachFlags;
+            final TraceRmiLaunchOffer attachOfferF = offer;
+
+            int waitSeconds = Math.max(1, timeoutSeconds);
+            ConsoleTaskMonitor monitor = new ConsoleTaskMonitor();
+            CompletableFuture<LaunchResult> future = CompletableFuture.supplyAsync(() ->
+                    attachOfferF.launchProgram(monitor, new LaunchConfigurator() {
+                        @Override
+                        public Map<String, ValStr<?>> configureLauncher(
+                                TraceRmiLaunchOffer launchOffer,
+                                Map<String, ValStr<?>> launchArgs,
+                                RelPrompt relPrompt) {
+                            Map<String, ValStr<?>> configured = new LinkedHashMap<>(launchArgs);
+                            configured.put(pidParamNameF, decodeLaunchValue(pidParamF, Long.toString(pidF)));
+                            LaunchParameter<?> flagsParam = launchOffer.getParameters()
+                                    .get("env:OPT_ATTACH_FLAGS");
+                            if (flagsParam != null && attachFlagsF != 0) {
+                                configured.put("env:OPT_ATTACH_FLAGS",
+                                        decodeLaunchValue(flagsParam, Integer.toString(attachFlags)));
+                            }
+                            if (pythonExecutable != null && !pythonExecutable.isBlank()) {
+                                setLaunchArgument(configured, launchOffer.getParameters(),
+                                        "env:OPT_PYTHON_EXE", pythonExecutable);
+                            }
+                            return configured;
+                        }
+                    }));
+
+            LaunchResult result;
+            try {
+                result = future.get(waitSeconds, TimeUnit.SECONDS);
+            } catch (TimeoutException e) {
+                monitor.cancel();
+                return Response.err("Debugger attach timed out after " + waitSeconds +
+                        "s waiting for a Trace RMI connection (waited on: launchProgram->" +
+                        "Trace RMI connect for pid " + pid + "). Check the launcher terminal, " +
+                        "Python debugger dependencies, and dbgeng/WinDbg installation.");
+            }
+
+            if (result.exception() != null) {
+                return Response.err("Debugger attach failed using '" + offer.getTitle() + "': " +
+                        result.exception().getMessage() +
+                        ". Check Ghidra's launcher terminal and debugger backend setup.");
+            }
+            if (result.trace() == null) {
+                return Response.err("Debugger attach did not produce an active trace using '" +
+                        offer.getTitle() + "'. Check Ghidra's launcher terminal for backend errors.");
+            }
+
+            // Same as launch(): launchProgram() does not make the new trace
+            // the trace manager's current one when driven programmatically.
+            DebuggerTraceManagerService traceMgr =
+                    tool.getService(DebuggerTraceManagerService.class);
+            Trace attachedTrace = result.trace();
+            if (traceMgr != null) {
+                Runnable activator = () -> traceMgr.activateTrace(attachedTrace);
+                if (SwingUtilities.isEventDispatchThread()) {
+                    activator.run();
+                } else {
+                    SwingUtilities.invokeAndWait(activator);
+                }
+            }
+
+            // Wait for the initial module enumeration and thread to land over
+            // Trace RMI (passive settle, same rationale as launch()).
+            int moduleCount = 0;
+            for (int i = 0; i < 75; i++) {
+                try {
+                    moduleCount = attachedTrace.getModuleManager().getAllModules().size();
+                } catch (Exception e) {
+                    moduleCount = 0;
+                }
+                TraceThread curThread = traceMgr != null ? traceMgr.getCurrentThread() : null;
+                if (moduleCount > 0 && curThread != null) {
+                    break;
+                }
+                Thread.sleep(200);
+            }
+
+            // Fault report 36 R4/P0-a: the dbgeng attach agent may not push
+            // the module table on its own. Ask the target to REFRESH (the
+            // same action the GUI's refresh button invokes) and wait again.
+            if (moduleCount == 0) {
+                TraceContext refreshCtx = new TraceContext(tool, traceMgr, attachedTrace,
+                        traceMgr != null ? traceMgr.getCurrent() : null, null, null, 0L);
+                if (invokeRefreshActions(refreshCtx)) {
+                    moduleCount = waitForModuleGrowth(attachedTrace, 0, MAPPING_SETTLE_TIMEOUT_MS);
+                }
+            }
+
+            // Establish the static<->dynamic identity mapping so
+            // static_to_dynamic/dynamic_to_static work against this trace.
+            if (program != null) {
+                DebuggerStaticMappingService attachMappingSvc =
+                        tool.getService(DebuggerStaticMappingService.class);
+                if (attachMappingSvc != null) {
+                    try {
+                        attachMappingSvc.addIdentityMapping(
+                                attachedTrace, program, Lifespan.nowOn(0), true);
+                    } catch (Exception e) {
+                        Msg.warn(this, "Could not establish static<->dynamic identity mapping for "
+                                + program.getName() + ": " + e.getMessage());
+                    }
+                }
+            }
+
+            Map<String, Object> response = new LinkedHashMap<>();
+            response.put("status", "attached");
+            response.put("pid", pid);
+            response.put("offer_title", offer.getTitle());
+            response.put("offer_config_name", offer.getConfigName());
+            response.put("trace_name", attachedTrace.getName());
+            response.put("module_count", moduleCount);
+            response.put("program", program != null ? program.getName() : null);
+            return Response.ok(response);
+        } catch (Exception e) {
+            return Response.err("Debugger attach failed: " + e.getMessage());
+        }
+    }
+
     @McpTool(path = "/debugger/status",
             description = "Get debugger status: active trace, thread, execution state, module count")
     public Response getStatus() {
@@ -759,13 +1080,66 @@ public class DebuggerService {
             if (actions.isEmpty()) {
                 return Response.err("Resume action not available in current state");
             }
-            // Execute the first available resume action
-            Target.ActionEntry action = actions.values().iterator().next();
-            invokeTargetAction(action);
-            return Response.ok(Map.of("status", "resumed"));
+            // Try each prompt-free resume action until the thread's execution
+            // state actually leaves STOPPED. Fault report 36 follow-up: the
+            // first prompt-free action can be a no-op variant (e.g. resume of
+            // a non-current thread) that reports success while the debuggee
+            // stays stopped.
+            Target.ActionEntry used = null;
+            String lastErr = null;
+            for (Target.ActionEntry action : actions.values()) {
+                if (action.requiresPrompt()) continue;
+                try {
+                    action.invokeAsync(false).get(ACTION_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                } catch (Exception e) {
+                    lastErr = e.getMessage();
+                    continue;
+                }
+                used = action;
+                if (waitForRunning(ctx, target, 3_000)) {
+                    return Response.ok(Map.of(
+                            "status", "resumed",
+                            "action", action.display()));
+                }
+            }
+            if (used == null) {
+                return Response.err("Resume failed: " +
+                        (lastErr != null ? lastErr : "only prompt-requiring actions available"));
+            }
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("status", "resumed");
+            result.put("action", used.display());
+            result.put("warning", "invoked but execution state did not confirm RUNNING within 3s");
+            return Response.ok(result);
         } catch (Exception e) {
             return Response.err("Resume failed: " + e.getMessage());
         }
+    }
+
+    /**
+     * Poll the current thread's execution state until it reports RUNNING (or
+     * the budget elapses). Used to confirm a resume action actually took
+     * effect rather than trusting the action's async completion.
+     */
+    private boolean waitForRunning(TraceContext ctx, Target target, long timeoutMs) {
+        if (ctx.thread() == null) return true; // nothing to confirm against
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                TraceExecutionState state = target.getThreadExecutionState(ctx.thread());
+                if (state == TraceExecutionState.RUNNING) return true;
+                if (state == TraceExecutionState.TERMINATED) return true;
+            } catch (Exception e) {
+                // keep polling until the deadline
+            }
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return false;
     }
 
     @McpTool(path = "/debugger/interrupt", method = "POST",
@@ -782,9 +1156,29 @@ public class DebuggerService {
             if (actions.isEmpty()) {
                 return Response.err("Interrupt action not available in current state");
             }
-            Target.ActionEntry action = actions.values().iterator().next();
+            Target.ActionEntry action = pickTargetAction(actions);
             invokeTargetAction(action);
-            return Response.ok(Map.of("status", "interrupted"));
+
+            // After the break, the Trace RMI adapter records the current
+            // module set asynchronously; on run-time LoadLibrary targets the
+            // launch-time snapshot is stale (fault report 36 R2). Wait
+            // passively for growth; if nothing arrives, actively ask the
+            // target to REFRESH (same action as the GUI refresh button) and
+            // wait once more. Report both counts so the caller can tell
+            // "no new modules" from "not settled yet".
+            int before = 0;
+            try {
+                before = ctx.trace.getModuleManager().getAllModules().size();
+            } catch (Exception ignored) {
+            }
+            int after = waitForModuleGrowth(ctx.trace, before, 2_000);
+            if (after <= before && invokeRefreshActions(ctx)) {
+                after = waitForModuleGrowth(ctx.trace, before, MAPPING_SETTLE_TIMEOUT_MS);
+            }
+            return Response.ok(Map.of(
+                    "status", "interrupted",
+                    "module_count_before", before,
+                    "module_count", after));
         } catch (Exception e) {
             return Response.err("Interrupt failed: " + e.getMessage());
         }
@@ -804,7 +1198,7 @@ public class DebuggerService {
             if (actions.isEmpty()) {
                 return Response.err("Step into not available in current state");
             }
-            Target.ActionEntry action = actions.values().iterator().next();
+            Target.ActionEntry action = pickTargetAction(actions);
             invokeStepAction(ctx, target, action);
             return Response.ok(Map.of("status", "stepped"));
         } catch (Exception e) {
@@ -826,7 +1220,7 @@ public class DebuggerService {
             if (actions.isEmpty()) {
                 return Response.err("Step over not available in current state");
             }
-            Target.ActionEntry action = actions.values().iterator().next();
+            Target.ActionEntry action = pickTargetAction(actions);
             invokeStepAction(ctx, target, action);
             return Response.ok(Map.of("status", "stepped"));
         } catch (Exception e) {
@@ -848,7 +1242,7 @@ public class DebuggerService {
             if (actions.isEmpty()) {
                 return Response.err("Step out not available in current state");
             }
-            Target.ActionEntry action = actions.values().iterator().next();
+            Target.ActionEntry action = pickTargetAction(actions);
             invokeStepAction(ctx, target, action);
             return Response.ok(Map.of("status", "stepped_out"));
         } catch (Exception e) {
@@ -1048,17 +1442,27 @@ public class DebuggerService {
         int readSize = Math.min(size, MAX_MEMORY_READ);
 
         try {
-            // Try to read from the trace first (cached data)
+            // Always force a read from the live target FIRST. The trace may
+            // never have captured these bytes, and memMgr.getBytes() then
+            // returns a zero-FILLED buffer with bytesRead == readSize, so a
+            // cached-first path silently reports zeros (verified live 2026-11-01
+            // on Ghidra 12.1.3 + dbgeng: even the bytes at RIP read as all-zero).
+            Target target = getTarget(ctx);
+            if (target != null) {
+                AddressSet addrSet = new AddressSet(addr, addr.add(readSize - 1));
+                target.readMemory(addrSet, new ConsoleTaskMonitor());
+            }
+
+            // Read back from the trace (now populated by the live capture)
             TraceMemoryManager memMgr = ctx.trace.getMemoryManager();
             ByteBuffer buf = ByteBuffer.allocate(readSize);
             int bytesRead = memMgr.getBytes(ctx.snap, addr, buf);
 
             if (bytesRead == 0) {
-                // Try forcing a read from the live target
-                Target target = getTarget(ctx);
+                // No capture landed at all -- retry once via the target
                 if (target != null) {
-                    AddressSet addrSet = new AddressSet(addr, addr.add(readSize - 1));
-                    target.readMemory(addrSet, new ConsoleTaskMonitor());
+                    AddressSet retrySet = new AddressSet(addr, addr.add(readSize - 1));
+                    target.readMemory(retrySet, new ConsoleTaskMonitor());
                     buf.clear();
                     bytesRead = memMgr.getBytes(ctx.snap, addr, buf);
                 }

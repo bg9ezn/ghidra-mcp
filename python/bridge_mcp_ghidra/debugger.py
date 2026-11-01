@@ -25,6 +25,32 @@ from .validation import validate_server_url
 _LOCAL_DEBUGGER_HOSTS = {"", "127.0.0.1", "localhost", "::1", "0.0.0.0"}
 
 
+def _parse_ghidra_hex(value):
+    """Parse a Ghidra address string as HEX.
+
+    Ghidra's Address.toString() emits hex WITHOUT a 0x prefix (e.g. the
+    image base 0x180000000 arrives as the string "180000000"). Parsing that
+    as decimal silently yields 0x0ABA9500 and every downstream runtime
+    translation lands at a wild address (fault report 36: trace breakpoints
+    were planted outside the module and dbgeng refused to run). Accepts ints
+    and "0x..."-prefixed strings too; returns None when unparseable.
+    """
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        return int(s, 16)
+    except ValueError:
+        try:
+            return int(s, 0)
+        except ValueError:
+            return None
+
+
 def _debugger_enabled(
     url: str = DEBUGGER_URL,
     platform: str = sys.platform,
@@ -190,7 +216,8 @@ def debugger_attach(target: str) -> str:
                         continue
                     prog_path = prog.get("path") or prog.get("name") or ""
                     image_base = prog.get("image_base") or prog.get("imageBase")
-                    if prog_path and image_base:
+                    image_base = _parse_ghidra_hex(image_base)
+                    if prog_path and image_base is not None:
                         ghidra_bases[prog_path] = image_base
                 if ghidra_bases:
                     _debugger_request("POST", "/debugger/sync_modules", {"ghidra_bases": ghidra_bases})
