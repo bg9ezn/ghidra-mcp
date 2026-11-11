@@ -666,7 +666,7 @@
           "name": "score_threshold",
           "required": false,
           "source": "query",
-          "type": "string"
+          "type": "number"
         },
         {
           "default": "",
@@ -674,7 +674,7 @@
           "name": "multi_threshold",
           "required": false,
           "source": "query",
-          "type": "string"
+          "type": "number"
         },
         {
           "default": "true",

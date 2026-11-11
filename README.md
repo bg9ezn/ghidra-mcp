@@ -172,6 +172,32 @@ v5.0 moves conventions from "things to remember" into the tool layer, where they
    GHIDRA_INSTALL_DIR=/path/to/ghidra gradle buildExtension
    ```
 
+### Windows one-click build: `build.bat`
+
+Self-contained batch entry (no Maven required): it auto-locates a local JDK 21+
+and the Ghidra install, then runs clean → compile → package → install. Tests
+are opt-in.
+
+```text
+build.bat                 ; full build + install (pauses at the end so the window stays readable)
+build.bat --nopause       ; same, without the end-of-build pause (scripts/CI)
+build.bat package         ; single phase: clean | compile | package | install
+build.bat test            ; sync uv venv + Java/Python tests
+build.bat clear           ; delete the uv project venv (.\ghidra-mcp)
+build.bat rebuild         ; force-recreate the venv, then full build
+```
+
+- Python tooling runs under [uv](https://docs.astral.sh/uv/); the project venv
+  is `.\ghidra-mcp` (`UV_PROJECT_ENVIRONMENT`), auto-created and synced from
+  `uv.lock` whenever tests are requested.
+- Each package refreshes the `createdOn` field in `extension.properties` with
+  the build timestamp — check it in Ghidra's extension manager to verify an
+  install landed. The `version` field stays matched to the Ghidra version
+  (mismatching it marks the extension red).
+- Install extracts straight into the Ghidra user-extensions directory (no zip
+  is copied into `Extensions\Ghidra`). Close Ghidra first — a running instance
+  file-locks the old plugin jar and install will abort with a clear error.
+
 ### Installation (Linux — Ubuntu/Debian)
 
 1. **Clone the repository:**

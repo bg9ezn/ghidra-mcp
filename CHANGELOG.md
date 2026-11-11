@@ -6,6 +6,29 @@ Complete version history for the Ghidra MCP Server project.
 
 ## v7.0.0 (unreleased) — major: tool consolidation, JSON response contract, MCP conformance suite, documentation-correctness linting
 
+### Build tooling
+
+- **`build.bat`** (Windows): self-contained one-click clean → compile →
+  package → install entry point with an embedded PowerShell build engine — no
+  Maven required; auto-locates a local JDK 21+ and the Ghidra install.
+  - `--nopause` skips the end-of-build pause for scripts/CI (default pauses so
+    double-click runs stay readable).
+  - Python tooling is managed by **uv**: the project venv defaults to
+    `.\ghidra-mcp` (`UV_PROJECT_ENVIRONMENT`) and is synced from `uv.lock`
+    (with automatic fallback when the lock drifts). `clear` deletes the venv,
+    `rebuild` force-recreates it, `test` provisions it and runs the Java/Python
+    tests.
+  - The default pipeline (`build`/`all`) does **not** run tests — always usable
+    offline; tests are opt-in via `test`.
+  - Each package refreshes `extension.properties`' `createdOn` with the build
+    timestamp so reinstalls are distinguishable in Ghidra's extension manager;
+    the `version` field stays matched to the Ghidra version (mismatching it
+    renders the extension red).
+  - `install` extracts directly into the Ghidra user-extensions directory and
+    no longer copies the zip into `Extensions\Ghidra` (stale copies from older
+    runs are swept); it fails fast with a clear message when a running Ghidra
+    instance file-locks the plugin jar.
+
 ### Tool consolidation (breaking) — 272 → 251 tools
 
 Redundant tools were folded into "one-or-many" survivors. **No capability was

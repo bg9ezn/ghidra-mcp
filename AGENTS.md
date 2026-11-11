@@ -38,6 +38,7 @@ You are a coding agent working on **ghidra-mcp**, a Model Context Protocol serve
 ## Commands
 
 - Build: `mvn clean package assembly:single -DskipTests`
+- Build (Windows one-click): `build.bat --nopause [phase]` — phases: `build` (default: clean+compile+package+install, no tests) | `clean` | `compile` | `package` | `install` | `test` (syncs uv venv first) | `clear`/`rebuild` (uv venv `.\ghidra-mcp`)
 - Quick compile: `mvn clean compile -q`
 - Test (Python): `pytest tests/unit/ -v --no-cov`
 - Preflight: `python -m tools.setup preflight --ghidra-path F:\ghidra_12.1.2_PUBLIC`

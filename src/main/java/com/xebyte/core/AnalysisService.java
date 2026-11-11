@@ -5313,14 +5313,18 @@ public class AnalysisService {
             }
         }
 
-        // Match once over the whole program; results are consumed by the write/read stage.
-        final List<FidSearchResult>[] resultsHolder = new List[1];
-        resultsHolder[0] = null;
+        // Match once over the whole program. FidMatch carries LIVE FidDB records
+        // and FidDB.close() nulls its StringsTable, so library/function names are
+        // resolved to plain strings while the query service is still open.
+        final List<FidMatchedFunction>[] itemsHolder = new List[1];
+        itemsHolder[0] = null;
         try {
             threadingStrategy.executeRead(() -> {
                 FidQueryService q = FidFileManager.getInstance().openFidQueryService(language, false);
                 try {
-                    resultsHolder[0] = fidService.processProgram(program, q, effectiveScore, TaskMonitor.DUMMY);
+                    List<FidSearchResult> results =
+                            fidService.processProgram(program, q, effectiveScore, TaskMonitor.DUMMY);
+                    itemsHolder[0] = materializeFidMatches(results);
                 } finally {
                     q.close();
                 }
@@ -5329,18 +5333,19 @@ public class AnalysisService {
         } catch (Exception e) {
             return Response.err("FID matching failed: " + e.getMessage());
         }
-        final List<FidSearchResult> allResults = resultsHolder[0] != null ? resultsHolder[0] : Collections.emptyList();
+        final List<FidMatchedFunction> allMatches =
+                itemsHolder[0] != null ? itemsHolder[0] : Collections.emptyList();
 
         // Build stats/samples/errors; write ONLY inside executeWrite.
         final Map<String, Object> outcome;
         try {
             if (dryRun) {
                 outcome = threadingStrategy.executeRead(() -> applyFidBuildOutcome(
-                        program, allResults, segments, effectiveScore, effectiveMulti,
+                        program, allMatches, segments, effectiveMulti,
                         alwaysApply, createBookmarks, createPlateComment, false, effectSamples, parseErrors, startMs));
             } else {
                 outcome = threadingStrategy.executeWrite(program, "Apply Function ID", () -> applyFidBuildOutcome(
-                        program, allResults, segments, effectiveScore, effectiveMulti,
+                        program, allMatches, segments, effectiveMulti,
                         alwaysApply, createBookmarks, createPlateComment, true, effectSamples, parseErrors, startMs));
             }
         } catch (Exception e) {
@@ -5359,9 +5364,70 @@ public class AnalysisService {
         return Response.ok(m);
     }
 
+    // FidDB-backed records are only valid while the FidQueryService is open
+    // (FidDB.close() nulls StringsTable), so names are resolved to plain
+    // strings inside the open scope before any later rename/comment phase.
+    private static class FidMatchedFunction {
+        final ghidra.program.model.listing.Function function;
+        final String libName;
+        final String fnName;
+        final float bestScore;
+        final float secondScore; // NEGATIVE_INFINITY when no runner-up
+
+        FidMatchedFunction(ghidra.program.model.listing.Function function, String libName,
+                           String fnName, float bestScore, float secondScore) {
+            this.function = function;
+            this.libName = libName;
+            this.fnName = fnName;
+            this.bestScore = bestScore;
+            this.secondScore = secondScore;
+        }
+    }
+
+    private List<FidMatchedFunction> materializeFidMatches(List<FidSearchResult> results) {
+        List<FidMatchedFunction> items = new ArrayList<>();
+        if (results == null) return items;
+        for (FidSearchResult r : results) {
+            if (r == null || r.function == null) continue;
+            if (r.matches == null || r.matches.isEmpty()) continue;
+
+            FidMatch best = null;
+            float bestScore = Float.NEGATIVE_INFINITY;
+            FidMatch second = null;
+            float secondScore = Float.NEGATIVE_INFINITY;
+            for (FidMatch mt : r.matches) {
+                float s = mt.getOverallScore();
+                if (best == null || s > bestScore) {
+                    second = best;
+                    secondScore = bestScore;
+                    best = mt;
+                    bestScore = s;
+                } else if (second == null || s > secondScore) {
+                    second = mt;
+                    secondScore = s;
+                }
+            }
+            if (best == null) continue;
+
+            final ghidra.feature.fid.db.LibraryRecord lib = best.getLibraryRecord();
+            String libName = lib != null ? lib.getLibraryFamilyName() : "lib";
+            String fnName = null;
+            try {
+                fnName = best.getFunctionRecord().getName();
+            } catch (Exception e) {
+                // name resolution failed (missing string record) -> builder reports unknown
+            }
+            items.add(new FidMatchedFunction(r.function,
+                    libName == null ? "lib" : libName,
+                    fnName == null ? "unknown" : fnName,
+                    bestScore, secondScore));
+        }
+        return items;
+    }
+
     private Map<String, Object> applyFidBuildOutcome(
-            Program program, List<FidSearchResult> results, List<AddressSet> segments,
-            float scoreThreshold, float multiThreshold, boolean alwaysApply,
+            Program program, List<FidMatchedFunction> matches, List<AddressSet> segments,
+            float multiThreshold, boolean alwaysApply,
             boolean createBookmarks, boolean createPlateComment, boolean write,
             int maxSamples, List<Map<String, Object>> parseErrors, long startMs) {
         final ghidra.program.model.listing.FunctionManager fm = program.getFunctionManager();
@@ -5392,9 +5458,8 @@ public class AnalysisService {
             }
         }
 
-        for (FidSearchResult r : results) {
-            ghidra.program.model.listing.Function func = r.function;
-            if (func == null) continue;
+        for (FidMatchedFunction item : matches) {
+            ghidra.program.model.listing.Function func = item.function;
             Address entry = func.getEntryPoint();
             if (!fullProgram) {
                 boolean inScope = false;
@@ -5403,48 +5468,21 @@ public class AnalysisService {
                 }
                 if (!inScope) continue;
             }
-            if (r.matches == null || r.matches.isEmpty()) continue;
-
-            // best match by overall score
-            FidMatch best = null;
-            float bestScore = Float.NEGATIVE_INFINITY;
-            FidMatch second = null;
-            float secondScore = Float.NEGATIVE_INFINITY;
-            for (FidMatch mt : r.matches) {
-                float s = mt.getOverallScore();
-                if (best == null || s > bestScore) {
-                    second = best;
-                    secondScore = bestScore;
-                    best = mt;
-                    bestScore = s;
-                } else if (second == null || s > secondScore) {
-                    second = mt;
-                    secondScore = s;
-                }
-            }
-            if (best == null) continue;
             matched++;
 
             // conflict: a competing candidate within the multi-name threshold
-            boolean conflict = false;
-            if (secondScore != Float.NEGATIVE_INFINITY && (bestScore - secondScore) < multiThreshold) {
-                conflict = true;
-            }
+            boolean conflict = item.secondScore != Float.NEGATIVE_INFINITY
+                    && (item.bestScore - item.secondScore) < multiThreshold;
 
             String oldName = func.getName();
-            boolean alreadyUserNamed = !ServiceUtils.isAutoGeneratedName(oldName)
-                    && !oldName.startsWith("lib.");
-            boolean apply = alwaysApply || ServiceUtils.isAutoGeneratedName(oldName) || oldName.startsWith("lib.");
+            boolean apply = alwaysApply || ServiceUtils.isAutoGeneratedName(oldName)
+                    || oldName.startsWith("lib.");
 
-            // library / symbol
-            final ghidra.feature.fid.db.LibraryRecord lib = best.getLibraryRecord();
-            String libName = lib != null ? lib.getLibraryFamilyName() : "lib";
-            String fnName = best.getFunctionRecord().getName();
             String newName;
             try {
-                newName = (fnName != null && fnName.contains("."))
-                        ? sanitizeSymbol(fnName)
-                        : sanitizeSymbol((libName == null ? "lib" : libName) + "." + (fnName == null ? "unknown" : fnName));
+                newName = item.fnName.contains(".")
+                        ? sanitizeSymbol(item.fnName)
+                        : sanitizeSymbol(item.libName + "." + item.fnName);
             } catch (Exception e) {
                 Map<String, Object> err = new LinkedHashMap<>();
                 err.put("address", entry.toString(false));
@@ -5465,10 +5503,10 @@ public class AnalysisService {
                 if (write && createBookmarks) {
                     program.getBookmarkManager().setBookmark(entry,
                             ghidra.program.model.listing.BookmarkType.ANALYSIS,
-                            "Function ID Analyzer", libName);
+                            "Function ID Analyzer", item.libName);
                 }
                 if (write && createPlateComment) {
-                    listing.setComment(entry, CodeUnit.PLATE_COMMENT, "Library: " + libName);
+                    listing.setComment(entry, CodeUnit.PLATE_COMMENT, "Library: " + item.libName);
                 }
             } catch (Exception e) {
                 Map<String, Object> err = new LinkedHashMap<>();
@@ -5478,7 +5516,7 @@ public class AnalysisService {
                 continue;
             }
 
-            int[] libStat = perLibrary.computeIfAbsent(libName == null ? "lib" : libName, k -> new int[2]);
+            int[] libStat = perLibrary.computeIfAbsent(item.libName, k -> new int[2]);
             libStat[0]++;
             if (write && apply && !newName.equals(oldName)) {
                 libStat[1]++;
