@@ -309,6 +309,21 @@ public class AnnotationScanner {
             if (value == null || value.isEmpty()) return defaultVal;
             return parseDoubleSafe(value, defaultVal);
 
+        } else if (type == float.class) {
+            float defaultVal = hasDef ? parseFloatSafe(def, 0.0f) : 0.0f;
+            if (value == null || value.isEmpty()) return defaultVal;
+            return parseFloatSafe(value, defaultVal);
+
+        } else if (type == Float.class) {
+            if (value == null || value.isEmpty()) {
+                if (hasDef) {
+                    try { return Float.valueOf(def); }
+                    catch (NumberFormatException e) { return null; }
+                }
+                return null;
+            }
+            try { return Float.parseFloat(value); } catch (NumberFormatException e) { return null; }
+
         } else if (type == long.class) {
             long defaultVal = hasDef ? parseLongSafe(def, 0L) : 0L;
             if (value == null || value.isEmpty()) return defaultVal;
@@ -380,6 +395,24 @@ public class AnnotationScanner {
             if (raw instanceof Number n) return n.doubleValue();
             return parseDoubleSafe(String.valueOf(raw), defaultVal);
 
+        } else if (type == float.class) {
+            float defaultVal = hasDef ? parseFloatSafe(def, 0.0f) : 0.0f;
+            if (raw == null) return defaultVal;
+            if (raw instanceof Number n) return n.floatValue();
+            return parseFloatSafe(String.valueOf(raw), defaultVal);
+
+        } else if (type == Float.class) {
+            if (raw == null) {
+                if (hasDef) {
+                    try { return Float.valueOf(def); }
+                    catch (NumberFormatException e) { return null; }
+                }
+                return null;
+            }
+            if (raw instanceof Number n) return n.floatValue();
+            try { return Float.parseFloat(String.valueOf(raw)); }
+            catch (NumberFormatException e) { return null; }
+
         } else if (type == Map.class) {
             return convertStringMap(body, binding.param.value());
 
@@ -429,6 +462,10 @@ public class AnnotationScanner {
         try { return Double.parseDouble(s); } catch (NumberFormatException e) { return def; }
     }
 
+    private static float parseFloatSafe(String s, float def) {
+        try { return Float.parseFloat(s); } catch (NumberFormatException e) { return def; }
+    }
+
     // ==================================================================
     // Schema generation
     // ==================================================================
@@ -458,7 +495,8 @@ public class AnnotationScanner {
         if (type == int.class || type == Integer.class) return "integer";
         if (type == long.class || type == Long.class) return "integer";
         if (type == boolean.class || type == Boolean.class) return "boolean";
-        if (type == double.class || type == Double.class) return "number";
+        if (type == double.class || type == Double.class
+                || type == float.class || type == Float.class) return "number";
         if (type == Map.class) return "object";
         if (type == List.class) return "array";
         if (type == Object.class) return "any";
