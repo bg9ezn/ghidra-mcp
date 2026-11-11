@@ -7,11 +7,34 @@ rem  The PowerShell build engine is embedded below the batch marker line;
 rem  this batch portion extracts it to a temp .ps1 and runs it with pwsh
 rem  (falling back to Windows PowerShell if pwsh is not on PATH).
 rem
-rem  Usage: build.bat [phase]   phases: all | clean | compile | test | package | install
+rem  Usage: build.bat [--nopause] [phase]
+rem    default  : build (= all) runs clean+compile+package+install, no tests
+rem    venv (uv): clear   - delete the uv project venv (default: .\ghidra-mcp)
+rem               rebuild - force delete the venv, recreate it, then full build
+rem               test    - sync uv venv + run Java/Python tests
+rem    other    : clean | compile | package | install
+rem    Each package refreshes extension.properties' createdOn with the build
+rem    timestamp (display-only; version stays matched to the Ghidra version).
+rem    --nopause: skip the end-of-build pause (for scripts/CI; default pauses
+rem    so double-click users can read the output before the window closes)
 rem ============================================================================
 setlocal
 set "GMCP_BAT=%~f0"
+set "GMCP_PAUSE=1"
 set "GMCP_PHASES=%*"
+if "%GMCP_PHASES%"=="" set "GMCP_PHASES=all"
+
+echo(%GMCP_PHASES%| findstr /i /c:"--nopause" >nul
+if not errorlevel 1 (
+    set "GMCP_PAUSE="
+    call set "GMCP_PHASES=%%GMCP_PHASES:--nopause=%%"
+)
+rem strip leading blanks left behind by the --nopause removal
+:gmcp_trim
+if "%GMCP_PHASES:~0,1%"==" " (
+    set "GMCP_PHASES=%GMCP_PHASES:~1%"
+    goto gmcp_trim
+)
 if "%GMCP_PHASES%"=="" set "GMCP_PHASES=all"
 
 where pwsh >nul 2>nul
@@ -19,6 +42,7 @@ if errorlevel 1 set "GMCP_PSH=powershell"
 if not errorlevel 1 set "GMCP_PSH=pwsh"
 
 %GMCP_PSH% -NoProfile -ExecutionPolicy Bypass -Command "$tok='#@GMCP_PWSH_BODY'+'@#'; $s=[IO.File]::ReadAllText($env:GMCP_BAT); $i=$s.IndexOf($tok); $b=$s.Substring($i+$tok.Length); $t=Join-Path $env:TEMP ('gmcp_build_' + [guid]::NewGuid().ToString('N') + '.ps1'); [IO.File]::WriteAllText($t, $b, [Text.UTF8Encoding]::new($false)); & $t $env:GMCP_PHASES; $c=$LASTEXITCODE; Remove-Item $t -ErrorAction SilentlyContinue; exit $c"
+if defined GMCP_PAUSE pause
 exit /b %ERRORLEVEL%
 #@GMCP_PWSH_BODY@#
 # =============================================================================
@@ -145,6 +169,62 @@ function Invoke-Clean {
 }
 
 # ---------------------------------------------------------------------------
+# Python venv via uv -- project environment at <root>\ghidra-mcp (default).
+# UV_PROJECT_ENVIRONMENT redirects uv sync/run away from the default .venv.
+# ---------------------------------------------------------------------------
+$VenvDir = Join-Path $Root "ghidra-mcp"
+$env:UV_PROJECT_ENVIRONMENT = $VenvDir
+# generous download timeout: uv's 30s default trips on slow networks/proxies
+if (-not $env:UV_HTTP_TIMEOUT) { $env:UV_HTTP_TIMEOUT = "300" }
+# parallel downloads stall behind flaky CDNs (each hung worker holds a cache
+# lock and starves the rest); serial is slow but always completes
+if (-not $env:UV_CONCURRENT_DOWNLOADS) { $env:UV_CONCURRENT_DOWNLOADS = "1" }
+
+function Invoke-VenvClear {
+    Write-Step "Venv clear (ghidra-mcp)"
+    if (Test-Path $VenvDir) {
+        Remove-Item -Recurse -Force $VenvDir
+        Write-Host "  removed venv: $VenvDir"
+    } else {
+        Write-Host "  venv not present: $VenvDir"
+    }
+}
+
+function Find-Uv {
+    $cmd = Get-Command uv -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    foreach ($c in @("$env:USERPROFILE\.local\bin\uv.exe",
+                     "$env:USERPROFILE\.cargo\bin\uv.exe",
+                     "$env:LOCALAPPDATA\Programs\uv\uv.exe")) {
+        if (Test-Path $c) { return $c }
+    }
+    return $null
+}
+
+function Invoke-VenvSync {
+    $Uv = Find-Uv
+    if (-not $Uv) {
+        Fail "uv not found on PATH or in ~/.local/bin -- install it first (https://docs.astral.sh/uv/)"
+    }
+    if (Test-Path (Join-Path $VenvDir "pyvenv.cfg")) {
+        Write-Step "Venv sync (existing: ghidra-mcp)"
+    } else {
+        Write-Step "Venv create (ghidra-mcp)"
+    }
+    Push-Location $Root
+    # --frozen: install strictly from the committed uv.lock; if the lock has
+    # drifted from pyproject.toml, fall back to a plain sync (updates lock).
+    & $Uv sync --frozen
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  uv sync --frozen failed (uv.lock drift?) -- retrying without --frozen"
+        & $Uv sync
+        if ($LASTEXITCODE -ne 0) { Fail "uv sync failed (exit $LASTEXITCODE)" }
+    }
+    Pop-Location
+    Write-Host "  python venv: $VenvDir"
+}
+
+# ---------------------------------------------------------------------------
 # classpath: every jar shipped under the Ghidra install
 # ---------------------------------------------------------------------------
 function Get-GhidraClasspath {
@@ -185,6 +265,7 @@ function Invoke-Compile {
 # ---------------------------------------------------------------------------
 function Invoke-Test {
     Write-Step "Test"
+    Invoke-VenvSync
     if (-not (Test-Path $Classes)) {
         Write-Host "  (no classes yet -- running compile first)"
         Invoke-Compile
@@ -214,11 +295,12 @@ function Invoke-Test {
         if (($parityOut -join "`n") -notmatch "\bOK\b") { Fail "EndpointsJsonParityTest did not report OK" }
     }
 
-    if (Get-Command uv -ErrorAction SilentlyContinue) {
+    $Uv = Find-Uv
+    if ($Uv) {
         Push-Location $Root
         $env:PYTHONUTF8 = "1"
         $env:PYTHONIOENCODING = "utf-8"
-        uv run --frozen python -m pytest tests/unit -q --no-cov --deselect "tests/unit/test_gradle_tasks.py"
+        & $Uv run --frozen python -m pytest tests/unit -q --no-cov --deselect "tests/unit/test_gradle_tasks.py"
         $pyExit = $LASTEXITCODE
         Pop-Location
         if ($pyExit -ne 0) { Fail "pytest failed (exit $pyExit)" }
@@ -250,6 +332,18 @@ function Invoke-Package {
         $text = Get-Content $file -Raw -Encoding $Encode
         foreach ($k in $tokenMap.Keys) { $text = $text.Replace($k, $tokenMap[$k]) }
         [System.IO.File]::WriteAllText($file, $text, $Utf8NoBom)
+    }
+
+    # Ghidra matches extension.properties' version against its own version
+    # (mismatch renders the extension red) -- never stamp it. Instead refresh
+    # createdOn (display-only in the extension manager) per build so reinstalls
+    # are distinguishable.
+    $ExtProps = Join-Path $ResOut "extension.properties"
+    if (Test-Path $ExtProps) {
+        $createdOn = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $text = Get-Content $ExtProps -Raw -Encoding $Encode
+        $text = $text -replace '(?m)^createdOn=.*$', "createdOn=$createdOn"
+        [System.IO.File]::WriteAllText($ExtProps, $text, $Utf8NoBom)
     }
 
     # 2. Jar
@@ -294,6 +388,7 @@ function Invoke-Package {
     Pop-Location
     if (-not (Test-Path $zipPath)) { Fail "zip creation failed" }
     Write-Host "  zip: $zipPath ($((Get-Item $zipPath).Length) bytes)"
+    Write-Host "  extension createdOn: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') (visible in Ghidra's extension manager)"
 }
 
 # ---------------------------------------------------------------------------
@@ -306,15 +401,14 @@ function Invoke-Install {
     $zipPath = Join-Path $DistDir $zipName
     if (-not (Test-Path $zipPath)) { Fail "No built zip at $zipPath -- run package first" }
 
-    # a) System extension dir (place the .zip; Ghidra picks it up on next start)
+    # a) System extension dir: no zip copy here -- the direct user-dir
+    #    extraction below replaces Ghidra's unzip-on-startup path. Just sweep
+    #    away zips left by older install runs.
     $extDir = Join-Path $Ghidra "Extensions\Ghidra"
-    New-Item -ItemType Directory -Force -Path $extDir | Out-Null
     foreach ($old in @(Get-ChildItem $extDir -Filter "GhidraMCP*.zip" -ErrorAction SilentlyContinue)) {
         Remove-Item -Force $old.FullName -ErrorAction SilentlyContinue
         Write-Host "  removed stale: $($old.Name)"
     }
-    Copy-Item $zipPath $extDir -Force
-    Write-Host "  installed extension zip: $extDir\$zipName"
 
     # b) User extension dir (extract so no GUI "install extension" is needed)
     $userBase = Join-Path $env:APPDATA "ghidra"
@@ -326,7 +420,13 @@ function Invoke-Install {
     }
     $userExt = Join-Path $userDir "Extensions\GhidraMCP"
     New-Item -ItemType Directory -Force -Path (Join-Path $userDir "Extensions") | Out-Null
-    if (Test-Path $userExt) { Remove-Item -Recurse -Force $userExt }
+    if (Test-Path $userExt) {
+        try {
+            Remove-Item -Recurse -Force $userExt -ErrorAction Stop
+        } catch {
+            Fail "Cannot update user extension: a file under $userExt is locked -- close Ghidra and re-run install"
+        }
+    }
     New-Item -ItemType Directory -Force -Path (Join-Path $userExt "lib") | Out-Null
 
     Copy-Item (Join-Path $DistDir "GhidraMCP-*") $userExt -Force -ErrorAction SilentlyContinue
@@ -346,14 +446,14 @@ function Invoke-Install {
     }
     Write-Host "  extracted user extension: $userExt"
 
-    # c) Copy the plugin jar to ghira's user lib so analysis tools see it via extension.properties
-    Write-Host "  installed to Ghidra $Ghidra (extension auto-loaded on next start; no GUI install required)"
+    # c) Done -- the user-dir extraction above is the whole install
+    Write-Host "  installed to Ghidra $GhidraVer user extensions (extract-only, no zip copied)"
 }
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-$valid = @("all", "clean", "compile", "test", "package", "install")
+$valid = @("all", "clean", "compile", "test", "package", "install", "clear", "build", "rebuild")
 if ($valid -notcontains $Phase.ToLower()) {
     Fail ("Unknown phase '$Phase'. Valid: " + ($valid -join ", "))
 }
@@ -366,12 +466,16 @@ Write-Host "  ghidra  : $Ghidra ($GhidraVer $($Meta.Layout))"
 Write-Host "=============================================================="
 
 switch ($Phase.ToLower()) {
-    "all"     { Invoke-Clean; Invoke-Compile; Invoke-Test; Invoke-Package; Invoke-Install }
+    # default pipeline: no venv sync, no tests -- always usable offline
+    "all"     { Invoke-Clean; Invoke-Compile; Invoke-Package; Invoke-Install }
     "clean"   { Invoke-Clean }
     "compile" { Invoke-Compile }
     "test"    { Invoke-Test }
     "package" { Invoke-Package }
     "install" { Invoke-Install }
+    "clear"   { Invoke-VenvClear }
+    "build"   { Invoke-Clean; Invoke-Compile; Invoke-Package; Invoke-Install }
+    "rebuild" { Invoke-VenvClear; Invoke-VenvSync; Invoke-Clean; Invoke-Compile; Invoke-Package; Invoke-Install }
 }
 
 Write-Host ""

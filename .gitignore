@@ -37,6 +37,8 @@ venv/
 env/
 ENV/
 .env/
+# uv project environment created by build.bat (default name: ghidra-mcp)
+/ghidra-mcp/
 
 # Python distribution / packaging
 .Python

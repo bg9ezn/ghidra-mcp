@@ -551,6 +551,12 @@ def test_collect_preflight_issues_passes_with_required_files(
         "tools.setup.ghidra.shutil.which",
         lambda name: "java" if name == "java" else None,
     )
+    # uv_executable() falls back to the bare "uv" when which() returns None,
+    # so the preflight probe would depend on the ambient PATH. Stub the whole
+    # availability check to keep this test hermetic.
+    monkeypatch.setattr(
+        "tools.setup.requirements.ensure_uv_available", lambda: "uv"
+    )
 
     issues = collect_preflight_issues(
         tmp_path,
